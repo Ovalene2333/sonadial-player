@@ -1,0 +1,26 @@
+[package]
+name = "sonadial_player"
+version = "0.1.0"
+edition = "2021"
+description = "Sonadial Player - geek-style native music player with circular spectrum"
+authors = ["Ovalene"]
+
+[dependencies]
+anyhow = "1.0"
+cpal = "0.18"
+dirs = "7.0"
+eframe = { version = "0.37", default-features = false, features = ["clipboard", "default_fonts", "glow"] }
+rfd = "0.17"
+ringbuf = "0.5"
+rustfft = "6.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+symphonia = { version = "0.6", features = ["aac", "alac", "flac", "isomp4", "mp3", "ogg", "pcm", "vorbis", "wav"] }
+ureq = "2.12"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
