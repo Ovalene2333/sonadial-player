@@ -2,8 +2,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, TextStyle, Visuals,
+    self, Color32, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Stroke, TextStyle,
+    Visuals,
 };
+
+use crate::design as tokens;
 
 struct Palette {
     dark: bool,
@@ -264,7 +267,7 @@ pub fn paint_background(painter: &egui::Painter, rect: egui::Rect) {
     match GRADIENTS[theme_index()] {
         Some((top, bottom)) => paint_gradient(painter, rect, top, bottom),
         None => {
-            painter.rect_filled(rect, 0.0, bg());
+            painter.rect_filled(rect, tokens::RADIUS, bg());
         }
     }
 }
@@ -274,7 +277,7 @@ pub fn paint_theme_preview(painter: &egui::Painter, rect: egui::Rect, index: usi
     match GRADIENTS[index] {
         Some((top, bottom)) => paint_gradient(painter, rect, top, bottom),
         None => {
-            painter.rect_filled(rect, 0.0, color(PALETTES[index].bg));
+            painter.rect_filled(rect, tokens::RADIUS, color(PALETTES[index].bg));
         }
     }
 }
@@ -398,6 +401,17 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.active.bg_fill = text_hi();
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, text_hi());
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, bg());
+    // Square widgets everywhere: egui's default rounded scrollbar handle
+    // reads as a modern overlay and breaks the terminal look.
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = tokens::RADIUS.into();
+    }
     visuals.window_shadow = egui::epaint::Shadow {
         offset: [0, 0],
         blur: 0,
@@ -405,6 +419,8 @@ pub fn apply(ctx: &egui::Context) {
         color: Color32::TRANSPARENT,
     };
     visuals.popup_shadow = visuals.window_shadow;
+    visuals.window_corner_radius = tokens::RADIUS.into();
+    visuals.menu_corner_radius = tokens::RADIUS.into();
 
     ctx.all_styles_mut(|style| {
         style.text_styles = std::collections::BTreeMap::from([
@@ -417,41 +433,100 @@ pub fn apply(ctx: &egui::Context) {
                 FontId::new(13.0, FontFamily::Monospace),
             ),
         ]);
-        style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-        style.spacing.button_padding = egui::vec2(6.0, 3.0);
-        style.spacing.interact_size.y = 22.0;
+        style.spacing.item_spacing = egui::vec2(tokens::SPACE_TIGHT, tokens::SPACE_1);
+        style.spacing.button_padding = egui::vec2(tokens::SPACE_TIGHT, tokens::HAIRLINE);
+        style.spacing.interact_size.y = tokens::CONTROL_H;
         style.spacing.scroll = egui::style::ScrollStyle::solid();
-        style.spacing.scroll.bar_width = 6.0;
-        style.spacing.scroll.bar_inner_margin = 2.0;
-        style.spacing.scroll.bar_outer_margin = 4.0;
+        style.spacing.scroll.bar_width = tokens::SPACE_TIGHT;
+        style.spacing.scroll.bar_inner_margin = tokens::HAIRLINE;
+        style.spacing.scroll.bar_outer_margin = tokens::SPACE_1;
         style.visuals = visuals.clone();
     });
 }
 
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    // Hack and Ubuntu are unused: the embedded faces cover every glyph this
+    // UI draws. Dropping them keeps only the typefaces the design needs.
+    fonts.font_data.remove("Hack");
+    fonts.font_data.remove("Ubuntu-Light");
 
-    // Sarasa Mono SC: Iosevka-style Latin and Source Han Sans CJK with
-    // exact half-width/full-width metrics. Embedded so the exe stays portable.
-    let sarasa = include_bytes!("../assets/fonts/SarasaMonoSC-Regular.ttf");
+    // Sarasa Mono SC supplies the narrower TUI/Latin face. Only Latin,
+    // punctuation, symbol and Braille ranges are embedded; CJK lives in the
+    // Fusion pixel faces below.
+    let sarasa = include_bytes!("../assets/fonts/SarasaMonoSC-TUI.ttf");
     fonts
         .font_data
         .insert("tui".to_owned(), Arc::new(FontData::from_static(sarasa)));
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        if let Some(list) = fonts.families.get_mut(&family) {
-            list.insert(0, "tui".to_owned());
-        }
-    }
 
-    // Fusion Pixel 12px handles CJK; Latin and missing glyphs fall back to
-    // Sarasa so Chinese stays on the 12px pixel grid while ASCII stays crisp.
+    // Dot-matrix Latin/narrow glyphs for the lyric readout. The main UI keeps
+    // Sarasa's TUI face; this one is reserved for lyrics and their brackets.
+    let lyric_tui = include_bytes!("../assets/fonts/FusionPixel12-Mono-TUI.ttf");
+    fonts.font_data.insert(
+        "lyric-tui".to_owned(),
+        Arc::new(FontData::from_static(lyric_tui)),
+    );
+
+    // epaint positions each fallback run from its own ascent. Fusion's CJK
+    // box already extends below the Latin baseline, so a small upward optical
+    // correction keeps Chinese from sitting low in mixed lines.
+    let fusion_tweak = FontTweak {
+        y_offset_factor: -0.16,
+        ..Default::default()
+    };
+
+    // Fusion Pixel 12px handles CJK.
     let compact = include_bytes!("../assets/fonts/FusionPixel12-Mono-CJK.ttf");
-    fonts
-        .font_data
-        .insert("ui".to_owned(), Arc::new(FontData::from_static(compact)));
+    fonts.font_data.insert(
+        "ui".to_owned(),
+        Arc::new(FontData::from_static(compact).tweak(fusion_tweak.clone())),
+    );
+
+    // Japanese and Korean live in separate pixel subsets: the Chinese face
+    // above only carries simplified forms and has no kana or hangul.
+    let japanese = include_bytes!("../assets/fonts/FusionPixel12-Mono-JA.ttf");
+    fonts.font_data.insert(
+        "ja".to_owned(),
+        Arc::new(FontData::from_static(japanese).tweak(fusion_tweak.clone())),
+    );
+    let korean = include_bytes!("../assets/fonts/FusionPixel12-Mono-KO.ttf");
+    fonts.font_data.insert(
+        "ko".to_owned(),
+        Arc::new(FontData::from_static(korean).tweak(fusion_tweak)),
+    );
+
+    // Fusion first so CJK punctuation stays pixel-shaped; Sarasa supplies the
+    // narrow Latin face and Braille when Fusion has no glyph.
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts.families.insert(
+            family,
+            vec![
+                "ui".to_owned(),
+                "ja".to_owned(),
+                "ko".to_owned(),
+                "tui".to_owned(),
+                "egui-icons".to_owned(),
+            ],
+        );
+    }
     fonts.families.insert(
         FontFamily::Name("ui".into()),
-        vec!["ui".to_owned(), "tui".to_owned()],
+        vec![
+            "ui".to_owned(),
+            "ja".to_owned(),
+            "ko".to_owned(),
+            "tui".to_owned(),
+        ],
+    );
+    fonts.families.insert(
+        FontFamily::Name("lyric".into()),
+        vec![
+            "lyric-tui".to_owned(),
+            "ui".to_owned(),
+            "ja".to_owned(),
+            "ko".to_owned(),
+            "tui".to_owned(),
+        ],
     );
 
     ctx.set_fonts(fonts);
