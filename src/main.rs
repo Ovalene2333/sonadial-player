@@ -5,8 +5,15 @@
 
 mod app;
 mod audio;
+mod beat;
+mod beat_config;
+mod decode;
+mod design;
 mod download;
 mod eq;
+mod lyrics;
+mod notes;
+mod pitch;
 mod spectrum;
 mod storage;
 mod theme;
