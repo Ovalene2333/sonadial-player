@@ -72,6 +72,8 @@ pub struct PersistedState {
     pub peak_freq: bool,
     #[serde(default = "default_true")]
     pub note_readout: bool,
+    #[serde(default = "default_true")]
+    pub show_lyrics: bool,
     #[serde(default)]
     pub piano_mode: bool,
 }
@@ -98,6 +100,7 @@ impl Default for PersistedState {
             peak_hold: default_peak_hold(),
             peak_freq: default_peak_freq(),
             note_readout: true,
+            show_lyrics: true,
             piano_mode: false,
         }
     }

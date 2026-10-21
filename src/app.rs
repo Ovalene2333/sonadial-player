@@ -30,6 +30,8 @@ const TOP_LABEL_Y: f32 = 16.0;
 const SIDEBAR_W: f32 = 360.0;
 const SIDEBAR_W_COMPACT: f32 = 320.0;
 const DOCK_H: f32 = 124.0;
+const VOLUME_STEP: f32 = 0.05;
+const SEEK_STEP: f64 = 5.0;
 const AUDIO_EXTS: &[&str] = &["mp3", "flac", "wav", "ogg", "m4a", "aac", "opus", "alac"];
 
 #[derive(Clone)]
@@ -192,6 +194,7 @@ pub struct SonadialApp {
     peak_hold: bool,
     peak_freq: bool,
     note_readout: bool,
+    show_lyrics: bool,
     piano_mode: bool,
     piano_history: VecDeque<NoteFrame>,
     show_radial: bool,
@@ -343,6 +346,7 @@ impl SonadialApp {
             peak_hold: state.peak_hold,
             peak_freq: state.peak_freq,
             note_readout: state.note_readout,
+            show_lyrics: state.show_lyrics,
             piano_mode: state.piano_mode,
             piano_history: VecDeque::new(),
             show_radial: state.show_radial,
@@ -541,14 +545,30 @@ impl SonadialApp {
             return;
         }
 
-        let (space, ctrl_o, left, right, ctrl_left, ctrl_right, escape) = ctx.input(|input| {
+        let (
+            space,
+            ctrl_o,
+            up,
+            down,
+            left,
+            right,
+            ctrl_left,
+            ctrl_right,
+            page_up,
+            page_down,
+            escape,
+        ) = ctx.input(|input| {
             (
                 input.key_pressed(Key::Space),
                 input.modifiers.ctrl && input.key_pressed(Key::O),
-                input.key_pressed(Key::ArrowLeft),
-                input.key_pressed(Key::ArrowRight),
+                input.key_pressed(Key::ArrowUp),
+                input.key_pressed(Key::ArrowDown),
+                input.key_pressed(Key::ArrowLeft) && !input.modifiers.ctrl,
+                input.key_pressed(Key::ArrowRight) && !input.modifiers.ctrl,
                 input.modifiers.ctrl && input.key_pressed(Key::ArrowLeft),
                 input.modifiers.ctrl && input.key_pressed(Key::ArrowRight),
+                input.key_pressed(Key::PageUp),
+                input.key_pressed(Key::PageDown),
                 input.key_pressed(Key::Escape),
             )
         });
@@ -568,14 +588,18 @@ impl SonadialApp {
             self.toggle_play();
             return;
         }
-        if ctrl_left {
-            self.seek_relative(-5.0);
-        } else if ctrl_right {
-            self.seek_relative(5.0);
-        } else if left {
+        if up {
+            self.adjust_volume(VOLUME_STEP);
+        } else if down {
+            self.adjust_volume(-VOLUME_STEP);
+        } else if page_up || ctrl_left {
             self.previous_track();
-        } else if right {
+        } else if page_down || ctrl_right {
             self.next_track();
+        } else if left {
+            self.seek_relative(-SEEK_STEP);
+        } else if right {
+            self.seek_relative(SEEK_STEP);
         }
     }
 
@@ -610,23 +634,7 @@ impl SonadialApp {
                     let target = fraction as f64 * self.duration();
                     self.seek_to(target);
                 }
-                Action::Volume(value) => {
-                    self.volume = value.clamp(0.0, 1.25);
-                    if let Some(index) = self.current {
-                        if let Some(track) = self.playlist.get(index) {
-                            let key = track.path.to_string_lossy().to_string();
-                            if (self.volume - self.default_volume).abs() < 0.001 {
-                                self.track_volumes.remove(&key);
-                            } else {
-                                self.track_volumes.insert(key, self.volume);
-                            }
-                        }
-                    } else {
-                        self.default_volume = self.volume;
-                    }
-                    self.engine.set_volume(self.volume);
-                    self.dirty = true;
-                }
+                Action::Volume(value) => self.set_volume(value),
                 Action::CycleMode => {
                     self.play_mode = self.play_mode.next();
                     if self.play_mode == PlayMode::Shuffle {
@@ -1503,13 +1511,17 @@ impl SonadialApp {
             }
         }
         // If the user stepped backwards, Next walks forward through the same
-        // history before choosing a new track.
-        for position in self.history_pos + 1..self.history.len() {
-            let path = self.history[position].clone();
-            if let Some(index) = self.playlist.iter().position(|track| track.path == path) {
-                self.history_pos = position;
-                self.start_playback(index, false);
-                return;
+        // history before choosing a new track. Shuffle deliberately skips
+        // this: it must pick a fresh random track instead of replaying the
+        // track the user just stepped back from.
+        if self.play_mode != PlayMode::Shuffle {
+            for position in self.history_pos + 1..self.history.len() {
+                let path = self.history[position].clone();
+                if let Some(index) = self.playlist.iter().position(|track| track.path == path) {
+                    self.history_pos = position;
+                    self.start_playback(index, false);
+                    return;
+                }
             }
         }
         let Some(current) = self.current else {
@@ -1528,8 +1540,19 @@ impl SonadialApp {
         if self.playlist.is_empty() {
             return;
         }
-        // Previous follows real playback history, so shuffle never invents a
-        // random "previous" track.
+        let Some(current) = self.current else {
+            self.play_index(0);
+            return;
+        };
+        // Shuffle picks a fresh random track in both directions. Walking the
+        // playback history here would make Prev follow the same order as
+        // sequence mode.
+        if self.play_mode == PlayMode::Shuffle {
+            let previous = self.random_other_index(current);
+            self.play_index(previous);
+            return;
+        }
+        // In the ordered modes Previous follows real playback history.
         for position in (0..self.history_pos).rev() {
             let path = self.history[position].clone();
             if let Some(index) = self.playlist.iter().position(|track| track.path == path) {
@@ -1538,12 +1561,18 @@ impl SonadialApp {
                 return;
             }
         }
-        let Some(current) = self.current else {
-            self.play_index(0);
-            return;
-        };
         let previous = (current + self.playlist.len() - 1) % self.playlist.len();
         self.play_index(previous);
+    }
+
+    fn random_other_index(&mut self, current: usize) -> usize {
+        let len = self.playlist.len();
+        if len <= 1 {
+            return current;
+        }
+        // An offset in 1..len always lands on a different track.
+        let offset = (self.next_random() % (len as u64 - 1)) as usize + 1;
+        (current + offset) % len
     }
 
     fn next_shuffle_index(&mut self, current: usize) -> usize {
@@ -1599,6 +1628,31 @@ impl SonadialApp {
         value ^= value << 17;
         self.rng_state = value;
         value
+    }
+
+    /// Single volume path for the slider, keyboard and presets. The active
+    /// track keeps its own level; without a track the default is updated so
+    /// the choice survives the next playback start.
+    fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.25);
+        if let Some(index) = self.current {
+            if let Some(track) = self.playlist.get(index) {
+                let key = track.path.to_string_lossy().to_string();
+                if (self.volume - self.default_volume).abs() < 0.001 {
+                    self.track_volumes.remove(&key);
+                } else {
+                    self.track_volumes.insert(key, self.volume);
+                }
+            }
+        } else {
+            self.default_volume = self.volume;
+        }
+        self.engine.set_volume(self.volume);
+        self.dirty = true;
+    }
+
+    fn adjust_volume(&mut self, delta: f32) {
+        self.set_volume(self.volume + delta);
     }
 
     fn seek_relative(&mut self, seconds: f64) {
@@ -1720,6 +1774,7 @@ impl SonadialApp {
             peak_hold: self.peak_hold,
             peak_freq: self.peak_freq,
             note_readout: self.note_readout,
+            show_lyrics: self.show_lyrics,
             piano_mode: self.piano_mode,
         };
         storage::save(&state);
@@ -2267,7 +2322,9 @@ impl SonadialApp {
                         }
                     }
 
-                    self.paint_lyrics(painter, rect);
+                    if self.show_lyrics {
+                        self.paint_lyrics(painter, rect);
+                    }
 
                     let status_rect = crate::viz::paint_core(
                         painter,
@@ -2970,9 +3027,11 @@ impl SonadialApp {
                                     ui.add_space(tokens::SPACE_1);
                                     for (keys, desc) in [
                                         ("SPACE", "播放 / 暂停"),
+                                        ("UP / DOWN", "音量 + / -"),
+                                        ("LEFT / RIGHT", "后退 / 前进 5 秒"),
+                                        ("PGUP / PGDN", "上一首 / 下一首"),
+                                        ("CTRL + LEFT/RIGHT", "上一首 / 下一首"),
                                         ("CTRL + O", "添加音频"),
-                                        ("LEFT / RIGHT", "上一首 / 下一首"),
-                                        ("CTRL + LEFT/RIGHT", "后退 / 前进 5 秒"),
                                         ("RIGHT-CLICK", "队列 / 导入 LRC / 删除"),
                                         ("ESC", "关闭面板"),
                                     ] {
@@ -3094,6 +3153,16 @@ impl SonadialApp {
                                         .clicked()
                                         {
                                             self.show_core_pulse = !self.show_core_pulse;
+                                            self.dirty = true;
+                                        }
+                                        if tui_button(
+                                            ui,
+                                            &toggle_label("LYRICS", self.show_lyrics),
+                                            toggle_w,
+                                        )
+                                        .clicked()
+                                        {
+                                            self.show_lyrics = !self.show_lyrics;
                                             self.dirty = true;
                                         }
                                     });
