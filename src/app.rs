@@ -166,7 +166,7 @@ pub struct SonadialApp {
     next_queue: VecDeque<PathBuf>,
     history: Vec<PathBuf>,
     history_pos: usize,
-    shuffle_bag: Vec<usize>,
+    shuffle_order: Vec<usize>,
     rng_state: u64,
     lyrics: Vec<LyricLine>,
     lyrics_synced: bool,
@@ -315,7 +315,7 @@ impl SonadialApp {
             next_queue: VecDeque::new(),
             history: Vec::new(),
             history_pos: 0,
-            shuffle_bag: Vec::new(),
+            shuffle_order: Vec::new(),
             rng_state: SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|duration| duration.as_nanos() as u64)
@@ -372,6 +372,11 @@ impl SonadialApp {
             device_check_at: Instant::now(),
             output_label: "NO OUTPUT".to_owned(),
         };
+
+        // The shuffle bag is drawn once per launch. Next and Previous both
+        // walk this fixed random order, so stepping back and forth never
+        // falls back to the sequential playlist order.
+        app.rebuild_shuffle_order();
 
         app.engine.set_volume(app.volume);
         app.engine.set_eq(&app.eq_gains, app.eq_enabled);
@@ -637,9 +642,6 @@ impl SonadialApp {
                 Action::Volume(value) => self.set_volume(value),
                 Action::CycleMode => {
                     self.play_mode = self.play_mode.next();
-                    if self.play_mode == PlayMode::Shuffle {
-                        self.shuffle_bag.clear();
-                    }
                 }
                 Action::ToggleSettings => {
                     self.show_settings = !self.show_settings;
@@ -841,7 +843,7 @@ impl SonadialApp {
             return;
         }
 
-        self.shuffle_bag.clear();
+        self.rebuild_shuffle_order();
         self.dirty = true;
         if self.current.is_none() {
             self.play_index(added[0]);
@@ -1080,7 +1082,7 @@ impl SonadialApp {
         };
 
         if record_history {
-            self.record_history(&track.path, index);
+            self.record_history(&track.path);
         } else if self.history.get(self.history_pos) != Some(&track.path) {
             if let Some(position) = self.history.iter().position(|path| path == &track.path) {
                 self.history_pos = position;
@@ -1142,7 +1144,7 @@ impl SonadialApp {
         }
     }
 
-    fn record_history(&mut self, path: &Path, index: usize) {
+    fn record_history(&mut self, path: &Path) {
         if self.history.is_empty() {
             self.history.push(path.to_owned());
             self.history_pos = 0;
@@ -1166,7 +1168,6 @@ impl SonadialApp {
             self.history.push(path.to_owned());
             self.history_pos = self.history.len() - 1;
         }
-        self.shuffle_bag.retain(|queued| *queued != index);
     }
 
     fn refresh_lyrics(&mut self) {
@@ -1465,7 +1466,7 @@ impl SonadialApp {
         self.playlist.remove(index);
         self.track_volumes.remove(&key);
         self.next_queue.retain(|queued| queued != &path);
-        self.shuffle_bag.clear();
+        self.rebuild_shuffle_order();
         if is_current {
             self.current = None;
             self.duration = 0.0;
@@ -1511,9 +1512,8 @@ impl SonadialApp {
             }
         }
         // If the user stepped backwards, Next walks forward through the same
-        // history before choosing a new track. Shuffle deliberately skips
-        // this: it must pick a fresh random track instead of replaying the
-        // track the user just stepped back from.
+        // history before choosing a new track. Shuffle skips this and follows
+        // its own fixed random order in both directions.
         if self.play_mode != PlayMode::Shuffle {
             for position in self.history_pos + 1..self.history.len() {
                 let path = self.history[position].clone();
@@ -1530,7 +1530,7 @@ impl SonadialApp {
         };
         let next = match self.play_mode {
             PlayMode::RepeatOne => current,
-            PlayMode::Shuffle => self.next_shuffle_index(current),
+            PlayMode::Shuffle => self.shuffle_step(current, true),
             PlayMode::Sequence => (current + 1) % self.playlist.len(),
         };
         self.play_index(next);
@@ -1544,11 +1544,11 @@ impl SonadialApp {
             self.play_index(0);
             return;
         };
-        // Shuffle picks a fresh random track in both directions. Walking the
-        // playback history here would make Prev follow the same order as
-        // sequence mode.
+        // Shuffle walks the same pre-drawn random order in both directions,
+        // so Prev then Next returns along that order instead of picking new
+        // randomness or falling back to the sequential playlist.
         if self.play_mode == PlayMode::Shuffle {
-            let previous = self.random_other_index(current);
+            let previous = self.shuffle_step(current, false);
             self.play_index(previous);
             return;
         }
@@ -1565,56 +1565,40 @@ impl SonadialApp {
         self.play_index(previous);
     }
 
-    fn random_other_index(&mut self, current: usize) -> usize {
+    /// Draw a fresh shuffle bag for the whole playlist. Called once at
+    /// startup, and again only when the playlist changes.
+    fn rebuild_shuffle_order(&mut self) {
         let len = self.playlist.len();
-        if len <= 1 {
-            return current;
-        }
-        // An offset in 1..len always lands on a different track.
-        let offset = (self.next_random() % (len as u64 - 1)) as usize + 1;
-        (current + offset) % len
-    }
-
-    fn next_shuffle_index(&mut self, current: usize) -> usize {
-        let len = self.playlist.len();
-        if len <= 1 {
-            return current;
-        }
-
-        self.shuffle_bag
-            .retain(|index| *index < len && *index != current);
-        if self.shuffle_bag.is_empty() {
-            // Refill only after every other track has been played once. Exclude
-            // the current and the immediately previous track to avoid the
-            // "A -> B -> A" boundary repeat.
-            let previous = self
-                .history_pos
-                .checked_sub(1)
-                .and_then(|position| self.history.get(position))
-                .and_then(|path| self.playlist.iter().position(|track| &track.path == path));
-            let mut bag = (0..len)
-                .filter(|index| *index != current && Some(*index) != previous)
-                .collect::<Vec<_>>();
-            if bag.is_empty() {
-                bag = (0..len).filter(|index| *index != current).collect();
-            }
-            self.shuffle_bag = bag;
-            self.shuffle_bag();
-        }
-
-        while let Some(index) = self.shuffle_bag.pop() {
-            if index < len && index != current {
-                return index;
-            }
-        }
-        current
-    }
-
-    fn shuffle_bag(&mut self) {
-        let len = self.shuffle_bag.len();
+        self.shuffle_order = (0..len).collect();
         for index in (1..len).rev() {
             let swap = (self.next_random() % (index as u64 + 1)) as usize;
-            self.shuffle_bag.swap(index, swap);
+            self.shuffle_order.swap(index, swap);
+        }
+    }
+
+    /// Move one step through the fixed shuffle order. The position is derived
+    /// from the current track, so clicking a track directly re-anchors the
+    /// walk without losing the rest of the bag.
+    fn shuffle_step(&mut self, current: usize, forward: bool) -> usize {
+        let len = self.playlist.len();
+        if len <= 1 {
+            return current;
+        }
+        if self.shuffle_order.len() != len {
+            self.rebuild_shuffle_order();
+        }
+        let Some(position) = self
+            .shuffle_order
+            .iter()
+            .position(|index| *index == current)
+        else {
+            self.rebuild_shuffle_order();
+            return self.shuffle_order.first().copied().unwrap_or(current);
+        };
+        if forward {
+            self.shuffle_order[(position + 1) % len]
+        } else {
+            self.shuffle_order[(position + len - 1) % len]
         }
     }
 
