@@ -22,6 +22,10 @@ use symphonia::core::units::Time;
 
 use crate::eq::{EqParams, EqProcessor, NUM_BANDS};
 
+// Short gain ramp used for starts, pauses, seeks and track changes. It is long
+// enough to remove clicks but still feels immediate.
+const FADE_SECS: f32 = 0.12;
+
 #[derive(Clone, Debug)]
 pub struct TrackInfo {
     pub path: PathBuf,
@@ -32,7 +36,7 @@ pub struct TrackInfo {
 
 #[derive(Debug)]
 enum Command {
-    Seek(f64),
+    Seek { target: f64, fallback: f64 },
     Stop,
 }
 
@@ -114,7 +118,10 @@ impl AudioEngine {
         let supported = pick_f32_config(&device)?;
         self.out_rate = supported.sample_rate();
         self.out_channels = supported.channels() as usize;
-        let config: StreamConfig = supported.into();
+        let mut config: StreamConfig = supported.into();
+        // A short fixed WASAPI buffer keeps the driver's allocation small while
+        // staying well above the decoder's refill latency.
+        config.buffer_size = cpal::BufferSize::Fixed(512);
 
         let eq_params = Arc::new(EqParams::new(
             &self.eq_gains,
@@ -133,10 +140,12 @@ impl AudioEngine {
         });
         *self.error.lock().unwrap() = None;
 
-        let capacity = (self.out_rate as usize * self.out_channels * 3).max(16_384);
+        // Two seconds of output is enough headroom for decoder hiccups and
+        // saves a megabyte over the old three-second buffer.
+        let capacity = (self.out_rate as usize * self.out_channels * 2).max(16_384);
         let (out_prod, mut out_cons) = HeapRb::<f32>::new(capacity).split();
         let (analysis_prod, analysis_cons) =
-            HeapRb::<f32>::new(crate::spectrum::ANALYSIS_RATE as usize * 2).split();
+            HeapRb::<f32>::new(crate::spectrum::ANALYSIS_RATE as usize).split();
 
         let cb_shared = shared.clone();
         let cb_error = self.error.clone();
@@ -147,6 +156,9 @@ impl AudioEngine {
         let mut last_epoch = 0_u64;
         let mut eq_snapshot = eq_params;
         let mut eq_processor = EqProcessor::new();
+        // Per-stream output envelope. Starts at silence and follows the
+        // requested pause/volume state one sample at a time.
+        let mut gain = 0.0_f32;
         let stream = device
             .build_output_stream(
                 config,
@@ -157,10 +169,13 @@ impl AudioEngine {
                     if epoch != last_epoch {
                         out_cons.clear();
                         eq_processor = EqProcessor::new();
+                        analysis_resampler.reset();
+                        gain = 0.0;
                         last_epoch = epoch;
                     }
 
-                    if cb_shared.paused.load(Ordering::Relaxed) {
+                    let paused = cb_shared.paused.load(Ordering::Relaxed);
+                    if paused && gain <= 0.0001 {
                         return;
                     }
 
@@ -168,9 +183,14 @@ impl AudioEngine {
                         eq_snapshot = params.clone();
                     }
                     let volume = f32::from_bits(cb_shared.volume_bits.load(Ordering::Relaxed));
+                    let target_gain = if paused { 0.0 } else { volume };
+                    let fade_step = 1.0 / (FADE_SECS * cb_shared.out_rate.max(1) as f32).max(1.0);
                     let mut produced = 0_u64;
 
                     for frame in data.chunks_mut(channels) {
+                        if paused && gain <= 0.0001 {
+                            break;
+                        }
                         if out_cons.occupied_len() < 2 {
                             break;
                         }
@@ -179,11 +199,17 @@ impl AudioEngine {
                         eq_processor.process(&mut left, &mut right, &eq_snapshot);
                         analysis_resampler.push(left, &mut analysis_prod);
 
+                        if gain < target_gain {
+                            gain = (gain + fade_step).min(target_gain);
+                        } else if gain > target_gain {
+                            gain = (gain - fade_step).max(target_gain);
+                        }
+
                         if channels == 1 {
-                            frame[0] = (left + right) * 0.5 * volume;
+                            frame[0] = (left + right) * 0.5 * gain;
                         } else {
-                            frame[0] = left * volume;
-                            frame[1] = right * volume;
+                            frame[0] = left * gain;
+                            frame[1] = right * gain;
                         }
 
                         produced += 1;
@@ -210,6 +236,7 @@ impl AudioEngine {
         let thread_path = path.to_owned();
         let decoder = thread::Builder::new()
             .name("sonadial-decoder".to_owned())
+            .stack_size(512 * 1024)
             .spawn(move || {
                 decode_loop(thread_path, thread_shared, out_prod, rx, thread_error);
             })
@@ -258,9 +285,16 @@ impl AudioEngine {
     }
 
     pub fn stop(&mut self) {
+        let had_stream = self.stream.is_some();
         if let Some(tx) = self.cmd_tx.take() {
+            self.shared.paused.store(true, Ordering::Relaxed);
             self.shared.stop.store(true, Ordering::Relaxed);
             let _ = tx.send(Command::Stop);
+        }
+        // Let the output callback ramp the last buffered samples down before
+        // the stream is dropped, so stopping does not produce a click.
+        if had_stream {
+            thread::sleep(Duration::from_secs_f32(FADE_SECS));
         }
         if let Some(handle) = self.decoder.take() {
             let _ = handle.join();
@@ -298,6 +332,7 @@ impl AudioEngine {
     pub fn seek(&self, seconds: f64) {
         let duration = self.duration();
         let target = seconds.clamp(0.0, duration.max(0.0));
+        let fallback = self.position();
         self.shared.position_frames.store(
             (target * self.out_rate as f64).round() as u64,
             Ordering::Relaxed,
@@ -305,7 +340,7 @@ impl AudioEngine {
         self.shared.seek_epoch.fetch_add(1, Ordering::Relaxed);
         self.shared.done.store(false, Ordering::Relaxed);
         if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(Command::Seek(target));
+            let _ = tx.send(Command::Seek { target, fallback });
         }
     }
 
@@ -509,6 +544,7 @@ fn decode_inner(
         .default_track(TrackType::Audio)
         .ok_or_else(|| anyhow!("文件中没有音频轨"))?;
     let track_id = track.id;
+    let time_base = track.time_base;
     let codec = track
         .codec_params
         .as_ref()
@@ -528,6 +564,9 @@ fn decode_inner(
 
     let mut resampler = LinearResampler::new(input_rate, shared.out_rate);
     let mut sample_buf: Vec<f32> = Vec::new();
+    // Accurate seeks land on the packet before the requested time. Drop the
+    // leading decoded frames so the audible stream really starts at `target`.
+    let mut trim_frames = 0_u64;
 
     loop {
         if shared.stop.load(Ordering::Relaxed) {
@@ -537,23 +576,46 @@ fn decode_inner(
         loop {
             match rx.try_recv() {
                 Ok(Command::Stop) => return Ok(()),
-                Ok(Command::Seek(seconds)) => {
-                    let time = Time::try_from_secs_f64(seconds).unwrap_or(Time::ZERO);
-                    let _ = format.seek(
+                Ok(Command::Seek { target, fallback }) => {
+                    let time = Time::try_from_secs_f64(target).unwrap_or(Time::ZERO);
+                    match format.seek(
                         SeekMode::Accurate,
                         SeekTo::Time {
                             time,
                             track_id: Some(track_id),
                         },
-                    );
-                    decoder.reset();
-                    resampler.reset();
-                    shared.position_frames.store(
-                        (seconds.max(0.0) * shared.out_rate as f64).round() as u64,
-                        Ordering::Relaxed,
-                    );
-                    shared.seek_epoch.fetch_add(1, Ordering::Relaxed);
-                    shared.done.store(false, Ordering::Relaxed);
+                    ) {
+                        Ok(seeked) => {
+                            // Accurate mode seeks to the packet at or before the
+                            // requested time. Keep the requested position and
+                            // trim the leading frames so audio does not lag it.
+                            let actual = time_base
+                                .and_then(|tb| tb.calc_time(seeked.actual_ts))
+                                .map(|time| time.as_secs_f64())
+                                .unwrap_or(target)
+                                .clamp(0.0, target);
+                            trim_frames =
+                                ((target - actual).max(0.0) * input_rate as f64).round() as u64;
+                            decoder.reset();
+                            resampler.reset();
+                            shared.position_frames.store(
+                                (target * shared.out_rate as f64).round() as u64,
+                                Ordering::Relaxed,
+                            );
+                            shared.seek_epoch.fetch_add(1, Ordering::Relaxed);
+                            shared.done.store(false, Ordering::Relaxed);
+                        }
+                        Err(_) => {
+                            // The decoder is still at the old packet. Restore
+                            // the old position instead of claiming the seek
+                            // succeeded.
+                            trim_frames = 0;
+                            shared.position_frames.store(
+                                (fallback.max(0.0) * shared.out_rate as f64).round() as u64,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
@@ -572,7 +634,13 @@ fn decode_inner(
                         audio.copy_to_slice_interleaved(&mut sample_buf);
 
                         let frames = sample_buf.len() / input_channels;
-                        for frame in 0..frames {
+                        let mut start = 0;
+                        if trim_frames > 0 {
+                            let drop = (trim_frames as usize).min(frames);
+                            trim_frames -= drop as u64;
+                            start = drop;
+                        }
+                        for frame in start..frames {
                             let base = frame * input_channels;
                             let left = sample_buf[base];
                             let right = if input_channels >= 2 {

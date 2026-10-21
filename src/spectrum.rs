@@ -4,6 +4,9 @@ use std::time::Instant;
 use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 
+use crate::beat_config::BeatConfig;
+use crate::pitch::{PitchState, PitchTracker};
+
 pub const NUM_BARS: usize = 100;
 pub const FFT_SIZE: usize = 1024;
 pub const ANALYSIS_RATE: u32 = 44_100;
@@ -13,7 +16,12 @@ const UI_STEP: f32 = 0.025;
 const VISUAL_ALPHA: f32 = 0.28;
 const LEVEL_GAIN: f32 = 2.4;
 const PEAK_DECAY: f32 = 0.995;
-
+// Bar heights ease in instead of snapping to each new FFT frame. The release
+// still uses the existing display blend, so the fall remains soft as well.
+const BAR_ATTACK: f32 = 0.28;
+const PEAK_FALL_DB_PER_SEC: f32 = 16.0;
+const DOMINANT_MIN_HZ: f32 = 30.0;
+const DOMINANT_MAX_HZ: f32 = 8_000.0;
 #[derive(Clone, Copy, Default, Debug)]
 pub struct VisualState {
     pub energy: f32,
@@ -22,6 +30,11 @@ pub struct VisualState {
     pub treble: f32,
     pub kick: f32,
     pub phase: f32,
+    /// Monotonic beat counter; changes exactly once per detected beat.
+    pub beat_seq: u64,
+    /// Strength of the most recent beat. Hard beats sit around 0.62-1.0,
+    /// while the soft pulse track stays around 0.18-0.34.
+    pub beat_strength: f32,
 }
 
 pub struct SpectrumEngine {
@@ -34,11 +47,14 @@ pub struct SpectrumEngine {
     bar_start: Vec<usize>,
     bar_end: Vec<usize>,
     bars: Vec<f32>,
+    peaks: Vec<f32>,
+    dominant_hz: f32,
     chunk_db: Vec<f32>,
     display: Vec<f32>,
     last_db: Vec<f32>,
     has_last: bool,
     beat: BeatDetector,
+    pitch: PitchTracker,
     visual: VisualFeatures,
     phase: f32,
     visual_accum: f32,
@@ -52,7 +68,7 @@ pub struct SpectrumEngine {
 }
 
 impl SpectrumEngine {
-    pub fn new() -> Self {
+    pub fn new(config: BeatConfig) -> Self {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let window = (0..FFT_SIZE)
@@ -86,11 +102,14 @@ impl SpectrumEngine {
             bar_start: edges[..NUM_BARS].to_vec(),
             bar_end: edges[1..].to_vec(),
             bars: vec![0.0; NUM_BARS],
+            peaks: vec![0.0; NUM_BARS],
+            dominant_hz: 0.0,
             chunk_db: vec![0.0; NUM_BARS],
             display: vec![0.0; NUM_BARS],
             last_db: vec![0.0; NUM_BARS],
             has_last: false,
-            beat: BeatDetector::new(),
+            beat: BeatDetector::new(config),
+            pitch: PitchTracker::new(),
             visual: VisualFeatures::new(),
             phase: 0.0,
             visual_accum: 0.0,
@@ -107,9 +126,12 @@ impl SpectrumEngine {
     pub fn reset(&mut self) {
         self.chunk_len = 0;
         self.bars.fill(0.0);
+        self.peaks.fill(0.0);
+        self.dominant_hz = 0.0;
         self.last_db.fill(0.0);
         self.has_last = false;
         self.beat.reset();
+        self.pitch.reset();
         self.visual.reset();
         self.has_new = false;
         self.audio_time = 0.0;
@@ -128,16 +150,20 @@ impl SpectrumEngine {
         self.beat_block_until = self.chunk_count.saturating_add(8);
         self.visual.kick = 0.0;
         self.visual.last_beat_sequence = 0;
+        self.visual.last_beat_strength = 0.0;
     }
 
     pub fn clear_display(&mut self) {
         self.chunk_len = 0;
         self.bars.fill(0.0);
+        self.peaks.fill(0.0);
+        self.dominant_hz = 0.0;
         self.last_db.fill(0.0);
         self.has_last = false;
         self.has_new = false;
         self.visual.reset();
         self.beat.reset();
+        self.pitch.reset();
         self.beat_state = (0, 0.0);
         self.chunk_count = 0;
         self.beat_block_until = 16;
@@ -147,11 +173,19 @@ impl SpectrumEngine {
     /// the analyser state, so stopping playback lets the bars fall naturally.
     pub fn decay_display(&mut self, dt: f32) {
         let factor = (-(dt.max(0.0)) / 0.18).exp();
-        for bar in &mut self.bars {
+        for (bar, peak) in self.bars.iter_mut().zip(self.peaks.iter_mut()) {
             *bar *= factor;
+            *peak = (*peak * factor).max(*bar);
             if *bar < 0.2 {
                 *bar = 0.0;
             }
+            if *peak < 0.2 {
+                *peak = 0.0;
+            }
+        }
+        self.dominant_hz *= (-(dt.max(0.0)) / 0.25).exp();
+        if self.dominant_hz < DOMINANT_MIN_HZ {
+            self.dominant_hz = 0.0;
         }
         self.last_db.fill(0.0);
         self.has_last = false;
@@ -163,6 +197,7 @@ impl SpectrumEngine {
     }
 
     pub fn push(&mut self, samples: &[f32]) {
+        self.pitch.push(samples);
         for &sample in samples {
             self.chunk[self.chunk_len] = sample;
             self.chunk_len += 1;
@@ -210,12 +245,70 @@ impl SpectrumEngine {
             self.has_last = true;
         }
         self.last_db.copy_from_slice(&self.display);
-        self.bars.copy_from_slice(&self.display);
+        for (bar, target) in self.bars.iter_mut().zip(self.display.iter()) {
+            if *target > *bar {
+                *bar += (*target - *bar) * BAR_ATTACK;
+            } else {
+                *bar = *target;
+            }
+        }
+        let fall = PEAK_FALL_DB_PER_SEC * FFT_SIZE as f32 / ANALYSIS_RATE as f32;
+        for (bar, peak) in self.bars.iter().zip(self.peaks.iter_mut()) {
+            *peak = (*peak - fall).max(*bar);
+        }
+        let bin_hz = ANALYSIS_RATE as f32 / FFT_SIZE as f32;
+        let min_bin = (DOMINANT_MIN_HZ / bin_hz).ceil() as usize;
+        let max_bin = ((DOMINANT_MAX_HZ / bin_hz).floor() as usize).min(self.mag.len() - 1);
+        let mut best_index = min_bin;
+        let mut best = 0.0;
+        for (index, value) in self.mag.iter().enumerate().take(max_bin + 1).skip(min_bin) {
+            if *value > best {
+                best = *value;
+                best_index = index;
+            }
+        }
+        let detected = if best > 1e-4 {
+            let left = self
+                .mag
+                .get(best_index.saturating_sub(1))
+                .copied()
+                .unwrap_or(best);
+            let right = self.mag.get(best_index + 1).copied().unwrap_or(best);
+            let denominator = left - 2.0 * best + right;
+            let offset = if denominator.abs() > 1e-12 {
+                (0.5 * (left - right) / denominator).clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
+            (best_index as f32 + offset) * bin_hz
+        } else {
+            0.0
+        };
+        self.dominant_hz = if detected > 0.0 {
+            if self.dominant_hz > 0.0 {
+                self.dominant_hz + (detected - self.dominant_hz) * 0.35
+            } else {
+                detected
+            }
+        } else {
+            self.dominant_hz * 0.88
+        };
+        if self.dominant_hz < DOMINANT_MIN_HZ {
+            self.dominant_hz = 0.0;
+        }
         self.has_new = true;
         self.beat_state = beat_state;
     }
 
-    pub fn tick(&mut self, playing: bool) -> VisualState {
+    pub fn peaks(&self) -> &[f32] {
+        &self.peaks
+    }
+
+    pub fn dominant_hz(&self) -> f32 {
+        self.dominant_hz
+    }
+
+    pub fn tick(&mut self, playing: bool, external_beat: Option<(u64, f32)>) -> VisualState {
         let now = Instant::now();
         let dt = now
             .duration_since(self.last_tick)
@@ -223,6 +316,7 @@ impl SpectrumEngine {
             .clamp(0.001, 0.2);
         self.last_tick = now;
         self.phase = (self.phase + 0.18 * dt) % std::f32::consts::TAU;
+        self.pitch.tick(dt);
 
         self.visual_accum += dt;
         if self.visual_accum >= UI_STEP {
@@ -233,7 +327,8 @@ impl SpectrumEngine {
             } else {
                 None
             };
-            self.visual.update(heights, playing, self.beat_state);
+            let beat_state = external_beat.unwrap_or(self.beat_state);
+            self.visual.update(heights, playing, beat_state);
             self.cached = VisualState {
                 energy: self.visual.energy,
                 bass: self.visual.bass,
@@ -241,6 +336,8 @@ impl SpectrumEngine {
                 treble: self.visual.treble,
                 kick: self.visual.kick,
                 phase: self.phase,
+                beat_seq: self.visual.last_beat_sequence,
+                beat_strength: self.visual.last_beat_strength,
             };
         }
         self.cached.phase = self.phase;
@@ -254,6 +351,10 @@ impl SpectrumEngine {
     pub fn visual(&self) -> VisualState {
         self.cached
     }
+
+    pub fn pitch(&self) -> &PitchState {
+        self.pitch.state()
+    }
 }
 
 struct BeatDetector {
@@ -262,6 +363,20 @@ struct BeatDetector {
     mid_mask: Vec<usize>,
     sensitivity: f32,
     min_interval: f64,
+    pair_window: f64,
+    short_interval: f64,
+    burst_cooldown: f64,
+    burst_max: u32,
+    quick_strength_min: f32,
+    quick_strength_max: f32,
+    quick_min_ratio: f32,
+    heavy_strength_min: f32,
+    heavy_strength_max: f32,
+    low_share_min: f32,
+    soft_min_interval: f64,
+    soft_merge: f64,
+    soft_strength_min: f32,
+    soft_strength_max: f32,
     output_delay: f64,
     soft_pulses: bool,
     low: BandTracker,
@@ -270,7 +385,11 @@ struct BeatDetector {
     prev_score: f32,
     prev_score2: f32,
     prev_low: f32,
+    prev_low_dominant: bool,
     lock_until: f64,
+    last_hard_time: f64,
+    last_hard_score: f32,
+    burst_count: u32,
     score_floor: Option<f32>,
     score_spread: f32,
     prev_soft: f32,
@@ -284,7 +403,8 @@ struct BeatDetector {
 }
 
 impl BeatDetector {
-    fn new() -> Self {
+    fn new(config: BeatConfig) -> Self {
+        let seconds = |milliseconds: f32| (milliseconds.max(0.0) as f64) / 1000.0;
         let freqs = (0..=FFT_SIZE / 2)
             .map(|i| i as f32 * ANALYSIS_RATE as f32 / FFT_SIZE as f32)
             .collect::<Vec<_>>();
@@ -311,8 +431,22 @@ impl BeatDetector {
             low_mask,
             wide_mask,
             mid_mask,
-            sensitivity: 0.42,
-            min_interval: 0.130,
+            sensitivity: config.sensitivity,
+            min_interval: seconds(config.heavy_min_interval_ms),
+            pair_window: seconds(config.heavy_pair_window_ms),
+            short_interval: seconds(config.heavy_short_interval_ms),
+            burst_cooldown: seconds(config.heavy_burst_cooldown_ms),
+            burst_max: config.heavy_burst_max,
+            quick_strength_min: config.quick_strength_min,
+            quick_strength_max: config.quick_strength_max,
+            quick_min_ratio: config.quick_min_ratio,
+            heavy_strength_min: config.heavy_strength_min,
+            heavy_strength_max: config.heavy_strength_max,
+            low_share_min: config.low_share_min,
+            soft_min_interval: seconds(config.soft_min_interval_ms),
+            soft_merge: seconds(config.soft_merge_ms),
+            soft_strength_min: config.soft_strength_min,
+            soft_strength_max: config.soft_strength_max,
             output_delay: 0.0,
             soft_pulses: true,
             low: BandTracker::new(),
@@ -321,7 +455,11 @@ impl BeatDetector {
             prev_score: 0.0,
             prev_score2: 0.0,
             prev_low: 0.0,
+            prev_low_dominant: false,
             lock_until: 0.0,
+            last_hard_time: -1.0,
+            last_hard_score: 0.0,
+            burst_count: 0,
             score_floor: None,
             score_spread: 0.1,
             prev_soft: 0.0,
@@ -342,7 +480,11 @@ impl BeatDetector {
         self.prev_score = 0.0;
         self.prev_score2 = 0.0;
         self.prev_low = 0.0;
+        self.prev_low_dominant = false;
         self.lock_until = 0.0;
+        self.last_hard_time = -1.0;
+        self.last_hard_score = 0.0;
+        self.burst_count = 0;
         self.score_floor = None;
         self.score_spread = 0.1;
         self.prev_soft = 0.0;
@@ -357,11 +499,12 @@ impl BeatDetector {
 
     fn process(&mut self, mag: &[f32], now: f64, allow_beats: bool) -> (u64, f32) {
         let (low_flux, low_relative, low_scale) = self.low.update(mag, &self.low_mask);
-        let (wide_flux, _, wide_scale) = self.wide.update(mag, &self.wide_mask);
+        let (wide_flux, wide_relative, wide_scale) = self.wide.update(mag, &self.wide_mask);
         let Some(low_scale) = low_scale else {
             return self.snapshot(now);
         };
         let wide_scale = wide_scale.unwrap_or(0.0);
+        let (mid_flux, mid_relative, mid_scale) = self.mid.update(mag, &self.mid_mask);
 
         let low_norm = low_flux / low_scale;
         let wide_norm = if wide_scale > 0.0 {
@@ -370,16 +513,23 @@ impl BeatDetector {
             0.0
         };
         let (score, low_driven) = if low_scale >= 0.30 * wide_scale.max(low_scale) {
-            (low_norm + 0.25 * wide_norm, true)
+            // Low-frequency first: the wide band no longer creates heavy hits.
+            (low_norm, true)
         } else {
             (wide_norm + 0.5 * low_norm, false)
         };
+        let low_share = low_norm / (low_norm + wide_norm + 1e-9);
+        let low_dominant = !low_driven || low_share >= self.low_share_min;
 
         let strictness = 0.7 + 3.4 * self.sensitivity;
         let threshold = self.track_threshold(score, strictness).max(0.10);
         let is_peak = self.prev_score >= self.prev_score2 && self.prev_score > score;
-        let loud_enough = low_relative >= 0.004;
-        let has_low = !low_driven || self.prev_low >= 0.20;
+        let loud_enough = if low_driven {
+            low_relative >= 0.004
+        } else {
+            wide_relative >= 0.004
+        };
+        let has_low = !low_driven || (self.prev_low >= 0.20 && self.prev_low_dominant);
         let mut hit = false;
 
         if allow_beats
@@ -389,25 +539,60 @@ impl BeatDetector {
             && self.prev_score > threshold
             && now >= self.lock_until
         {
-            let over = (self.prev_score - threshold) / threshold.max(0.1);
-            let strength = (0.62 + 0.38 * over.min(1.0)).clamp(0.62, 1.0);
-            self.lock_until = now + self.min_interval;
-            self.enqueue(now + self.output_delay, strength);
-            hit = true;
+            let dt = now - self.last_hard_time;
+            let normal = dt >= self.min_interval;
+            let quick = dt >= self.short_interval
+                && dt < self.pair_window
+                && self.burst_count < self.burst_max
+                && self.prev_score >= self.quick_min_ratio * self.last_hard_score;
+            if normal || quick {
+                let over = (self.prev_score - threshold) / threshold.max(0.1);
+                let strength = if quick {
+                    self.quick_strength_min
+                        + (self.quick_strength_max - self.quick_strength_min) * over.min(1.0)
+                } else {
+                    (self.heavy_strength_min
+                        + (self.heavy_strength_max - self.heavy_strength_min) * over.min(1.0))
+                    .clamp(self.heavy_strength_min, self.heavy_strength_max)
+                };
+                if quick {
+                    self.burst_count += 1;
+                    self.lock_until = if self.burst_count >= self.burst_max {
+                        now + self.burst_cooldown
+                    } else {
+                        now + self.short_interval
+                    };
+                } else {
+                    self.burst_count = 0;
+                    self.lock_until = now + self.short_interval;
+                }
+                self.last_hard_time = now;
+                self.last_hard_score = self.prev_score;
+                self.enqueue(now + self.output_delay, strength);
+                hit = true;
+            }
         }
 
         if self.soft_pulses {
-            self.process_soft(mag, now, hit, allow_beats);
+            self.process_soft(mid_flux, mid_relative, mid_scale, now, hit, allow_beats);
         }
 
         self.prev_score2 = self.prev_score;
         self.prev_score = score;
         self.prev_low = low_norm;
+        self.prev_low_dominant = low_dominant;
         self.snapshot(now)
     }
 
-    fn process_soft(&mut self, mag: &[f32], now: f64, hard_hit: bool, allow_beats: bool) {
-        let (flux, relative, scale) = self.mid.update(mag, &self.mid_mask);
+    fn process_soft(
+        &mut self,
+        flux: f32,
+        relative: f32,
+        scale: Option<f32>,
+        now: f64,
+        hard_hit: bool,
+        allow_beats: bool,
+    ) {
         let Some(scale) = scale else {
             return;
         };
@@ -429,11 +614,13 @@ impl BeatDetector {
             && relative >= 0.004
             && self.prev_soft > threshold
             && now >= self.soft_lock_until
-            && now >= self.lock_until - self.min_interval * 0.5
+            && now - self.last_hard_time >= self.soft_merge
         {
             let over = (self.prev_soft - threshold) / threshold.max(0.1);
-            let strength = (0.18 + 0.16 * over.min(1.0)).clamp(0.18, 0.34);
-            self.soft_lock_until = now + 0.15;
+            let strength = (self.soft_strength_min
+                + (self.soft_strength_max - self.soft_strength_min) * over.min(1.0))
+            .clamp(self.soft_strength_min, self.soft_strength_max);
+            self.soft_lock_until = now + self.soft_min_interval;
             self.enqueue(now + self.output_delay, strength);
         }
 
@@ -548,6 +735,7 @@ struct VisualFeatures {
     kick: f32,
     peak_hold: f32,
     last_beat_sequence: u64,
+    last_beat_strength: f32,
     raw: Vec<f32>,
     norm: Vec<f32>,
     sort_buf: Vec<f32>,
@@ -563,6 +751,7 @@ impl VisualFeatures {
             kick: 0.0,
             peak_hold: 0.25,
             last_beat_sequence: 0,
+            last_beat_strength: 0.0,
             raw: vec![0.0; NUM_BARS],
             norm: vec![0.0; NUM_BARS],
             sort_buf: Vec::with_capacity(NUM_BARS),
@@ -577,6 +766,7 @@ impl VisualFeatures {
         self.kick = 0.0;
         self.peak_hold = 0.25;
         self.last_beat_sequence = 0;
+        self.last_beat_strength = 0.0;
     }
 
     fn update(&mut self, heights: Option<&[f32]>, playing: bool, beat_state: (u64, f32)) {
@@ -636,8 +826,11 @@ impl VisualFeatures {
         let (sequence, strength) = beat_state;
         if sequence < self.last_beat_sequence {
             self.last_beat_sequence = sequence;
+            self.last_beat_strength = 0.0;
         } else if sequence > self.last_beat_sequence {
-            self.kick = self.kick.max(strength.clamp(0.0, 1.0));
+            let strength = strength.clamp(0.0, 1.0);
+            self.kick = self.kick.max(strength);
+            self.last_beat_strength = strength;
             self.last_beat_sequence = sequence;
             return;
         }
