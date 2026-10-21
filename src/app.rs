@@ -488,6 +488,14 @@ impl SonadialApp {
             self.playing = false;
         }
 
+        if let Some(notice) = self.engine.take_notice() {
+            // The seek was rejected and the clock is back at the old position,
+            // so stop showing the line we tried to land on as complete.
+            self.lyric_seek_full = false;
+            self.lyric_seek_index = None;
+            self.error = Some(notice);
+        }
+
         if self.playing && self.engine.is_finished() {
             self.playing = false;
             self.paused = false;
