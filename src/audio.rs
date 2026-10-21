@@ -129,6 +129,17 @@ impl AudioEngine {
     }
 
     pub fn play(&mut self, path: &Path) -> Result<()> {
+        self.play_with(path, false)
+    }
+
+    /// Open the track with the output parked: the decoder fills its buffer but
+    /// nothing is audible until `resume()` is called. Used when the user seeks
+    /// while nothing is playing.
+    pub fn play_paused(&mut self, path: &Path) -> Result<()> {
+        self.play_with(path, true)
+    }
+
+    fn play_with(&mut self, path: &Path, start_paused: bool) -> Result<()> {
         self.stop();
 
         let info = probe(path).with_context(|| format!("无法解析 {}", path.display()))?;
@@ -156,7 +167,7 @@ impl AudioEngine {
             self.out_rate,
         ));
         let shared = Arc::new(Shared {
-            paused: AtomicBool::new(false),
+            paused: AtomicBool::new(start_paused),
             volume_bits: AtomicU32::new(self.volume().to_bits()),
             position_frames: AtomicU64::new(0),
             seek_epoch: AtomicU64::new(0),

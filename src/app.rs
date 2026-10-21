@@ -1061,6 +1061,12 @@ impl SonadialApp {
     }
 
     fn start_playback(&mut self, index: usize, record_history: bool) {
+        self.start_playback_at(index, record_history, None);
+    }
+
+    /// `park_at` opens the track silently at that position: the stream exists
+    /// and the buffer is filled, but playback stays paused until PLAY.
+    fn start_playback_at(&mut self, index: usize, record_history: bool, park_at: Option<f64>) {
         let Some(track) = self.playlist.get(index).cloned() else {
             return;
         };
@@ -1089,10 +1095,14 @@ impl SonadialApp {
             .clamp(0.0, 1.25);
         self.engine.set_volume(self.volume);
         self.engine.set_eq(&self.eq_gains, self.eq_enabled);
-        match self.engine.play(&track.path) {
+        let opened = match park_at {
+            Some(_) => self.engine.play_paused(&track.path),
+            None => self.engine.play(&track.path),
+        };
+        match opened {
             Ok(()) => {
                 self.playing = true;
-                self.paused = false;
+                self.paused = park_at.is_some();
                 self.error = None;
                 self.analyzer.reset();
                 self.piano_history.clear();
@@ -1106,6 +1116,14 @@ impl SonadialApp {
                 self.engine.set_volume(self.volume);
                 self.start_beat_analysis(&track.path);
                 self.start_note_analysis(&track.path);
+                if let Some(target) = park_at {
+                    // The stream is already parked, so this seek only moves the
+                    // buffer and the clock; the user still has to press PLAY.
+                    if self.engine.seek(target) {
+                        self.engine.flush_analysis();
+                        self.mark_lyric_seek(target);
+                    }
+                }
                 self.dirty = true;
             }
             Err(error) => {
@@ -1589,8 +1607,23 @@ impl SonadialApp {
 
     /// Single seek path. Both the progress bar and keyboard seeks go through
     /// here so position, lyrics, beat state and preview can never diverge.
+    ///
+    /// Seeking during playback keeps playing. Seeking while paused, stopped or
+    /// finished only moves the position and stays parked; PLAY resumes there.
     fn seek_to(&mut self, target: f64) {
         let target = target.clamp(0.0, self.duration().max(0.0));
+        let was_playing = self.playing && !self.paused && !self.engine.is_paused();
+
+        if self.engine.info().is_none() {
+            // Nothing is loaded. Open the selected track silently at the target
+            // so the jump still lands instead of faking a playing state.
+            let Some(index) = self.current else {
+                return;
+            };
+            self.start_playback_at(index, false, Some(target));
+            return;
+        }
+
         if !self.engine.seek(target) {
             return;
         }
@@ -1603,7 +1636,14 @@ impl SonadialApp {
         self.offline_last_pos = None;
         self.seek_preview = None;
         self.playing = true;
-        self.paused = self.engine.is_paused();
+        if was_playing {
+            self.paused = false;
+        } else {
+            // Keep the parked state so the button stays on PLAY: the jump must
+            // not start audio the user did not ask for.
+            self.engine.pause();
+            self.paused = true;
+        }
     }
 
     /// A manual seek should not replay the typewriter for the line we landed
