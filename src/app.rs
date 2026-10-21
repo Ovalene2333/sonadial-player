@@ -171,9 +171,6 @@ pub struct SonadialApp {
     lyrics_track: Option<PathBuf>,
     lyric_seek_full: bool,
     lyric_seek_index: Option<usize>,
-    /// Target time of the latest manual seek. Lyrics use this directly while
-    /// the decoder is still catching up, instead of reading the old position.
-    lyric_seek_target: Option<(f64, Instant)>,
     pending_delete: Option<PathBuf>,
     playing: bool,
     paused: bool,
@@ -325,7 +322,6 @@ impl SonadialApp {
             lyrics_track: None,
             lyric_seek_full: false,
             lyric_seek_index: None,
-            lyric_seek_target: None,
             pending_delete: None,
             playing: false,
             paused: false,
@@ -1142,7 +1138,6 @@ impl SonadialApp {
     fn refresh_lyrics(&mut self) {
         self.lyric_seek_full = false;
         self.lyric_seek_index = None;
-        self.lyric_seek_target = None;
         let Some(track) = self.current_track().cloned() else {
             self.lyrics.clear();
             self.lyrics_synced = false;
@@ -1153,20 +1148,6 @@ impl SonadialApp {
         let parsed = track.lrc.as_deref().map(lyrics::load).unwrap_or_default();
         self.lyrics = parsed.lines;
         self.lyrics_synced = parsed.synced;
-    }
-
-    /// Position used by the lyric display. After a manual seek the decoder can
-    /// briefly keep reporting the old position; use the seek target instead so
-    /// the line is always selected from the time the user actually jumped to.
-    fn lyric_position(&self) -> f64 {
-        let actual = self.position();
-        if let Some((target, seek_at)) = self.lyric_seek_target {
-            let fresh = seek_at.elapsed() < Duration::from_millis(1200);
-            if fresh && (actual < target - 0.02 || (actual - target).abs() > 0.35) {
-                return target;
-            }
-        }
-        actual
     }
 
     fn lyric_index_at(&self, position: f64) -> Option<(usize, bool)> {
@@ -1195,10 +1176,6 @@ impl SonadialApp {
         ))
     }
 
-    fn current_lyric_index(&self) -> Option<(usize, bool)> {
-        self.lyric_index_at(self.lyric_position())
-    }
-
     fn lyric_line_interval(&self, index: usize) -> (f64, f64) {
         let count = self.lyrics.len().max(1);
         if self.lyrics_synced {
@@ -1222,7 +1199,7 @@ impl SonadialApp {
 
     /// Number of characters visible while the active lyric is being typed.
     /// `None` means "inactive, show the whole line without a cursor".
-    fn lyric_typed_chars(&self, index: usize, active: bool) -> Option<usize> {
+    fn lyric_typed_chars(&self, index: usize, active: bool, position: f64) -> Option<usize> {
         if !active {
             return None;
         }
@@ -1240,7 +1217,7 @@ impl SonadialApp {
         let natural = (units / 5.0).clamp(0.35, 10.0);
         let next_line_limit = (interval - 0.10).max(0.18);
         let duration = natural.min(next_line_limit);
-        let elapsed = (self.lyric_position() - start).max(0.0);
+        let elapsed = (position - start).max(0.0);
         if elapsed >= duration {
             return Some(chars);
         }
@@ -1249,11 +1226,13 @@ impl SonadialApp {
     }
 
     fn paint_lyrics(&mut self, painter: &egui::Painter, rect: Rect) {
-        let Some((index, active)) = self.current_lyric_index() else {
+        // Select the line and its typed prefix from one audio-clock snapshot.
+        let position = self.position();
+        let Some((index, active)) = self.lyric_index_at(position) else {
             return;
         };
 
-        let mut typed = self.lyric_typed_chars(index, active);
+        let mut typed = self.lyric_typed_chars(index, active, position);
         if self.lyric_seek_full {
             if self.lyric_seek_index == Some(index) {
                 typed = None;
@@ -1399,7 +1378,6 @@ impl SonadialApp {
         self.seek_preview = None;
         self.lyric_seek_full = false;
         self.lyric_seek_index = None;
-        self.lyric_seek_target = None;
     }
 
     fn queue_next(&mut self, index: usize) {
@@ -1466,7 +1444,6 @@ impl SonadialApp {
             self.lyrics_track = None;
             self.lyric_seek_full = false;
             self.lyric_seek_index = None;
-            self.lyric_seek_target = None;
         } else {
             if let Some(current) = self.current {
                 if current > index {
@@ -1599,19 +1576,16 @@ impl SonadialApp {
     }
 
     fn seek_relative(&mut self, seconds: f64) {
-        let base = self
-            .lyric_seek_target
-            .filter(|(_, at)| at.elapsed() < Duration::from_millis(700))
-            .map(|(target, _)| target)
-            .unwrap_or_else(|| self.position());
-        self.seek_to(base + seconds);
+        self.seek_to(self.position() + seconds);
     }
 
     /// Single seek path. Both the progress bar and keyboard seeks go through
     /// here so position, lyrics, beat state and preview can never diverge.
     fn seek_to(&mut self, target: f64) {
         let target = target.clamp(0.0, self.duration().max(0.0));
-        self.engine.seek(target);
+        if !self.engine.seek(target) {
+            return;
+        }
         self.engine.flush_analysis();
         self.mark_lyric_seek(target);
         self.analyzer.reset_beat();
@@ -1621,18 +1595,16 @@ impl SonadialApp {
         self.offline_last_pos = None;
         self.seek_preview = None;
         self.playing = true;
-        self.paused = false;
+        self.paused = self.engine.is_paused();
     }
 
     /// A manual seek should not replay the typewriter for the line we landed
     /// on; show that line complete and resume typing from the next one. The
-    /// line is selected from the seek target time, not from the decoder's
-    /// still-stale position.
+    /// line is selected from the seek target time while the engine flushes.
     fn mark_lyric_seek(&mut self, target: f64) {
         let landed = self.lyric_index_at(target);
         self.lyric_seek_full = landed.map_or(false, |(_, active)| active);
         self.lyric_seek_index = landed.map(|(index, _)| index);
-        self.lyric_seek_target = Some((target, Instant::now()));
     }
 
     fn duration(&self) -> f64 {
