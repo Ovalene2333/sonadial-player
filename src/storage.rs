@@ -24,6 +24,14 @@ fn default_eq_preset() -> usize {
     1
 }
 
+fn default_peak_hold() -> bool {
+    true
+}
+
+fn default_peak_freq() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     #[serde(default)]
@@ -39,7 +47,9 @@ pub struct PersistedState {
     #[serde(default = "default_true")]
     pub show_bg_spectrum: bool,
     #[serde(default)]
-    pub char_stream: bool,
+    pub braille_stream: bool,
+    #[serde(default)]
+    pub led_bars: bool,
     #[serde(default = "default_true")]
     pub show_radial: bool,
     #[serde(default = "default_true")]
@@ -54,6 +64,16 @@ pub struct PersistedState {
     pub eq_gains: Vec<f32>,
     #[serde(default = "default_eq_preset")]
     pub eq_preset: usize,
+    #[serde(default)]
+    pub lrc_map: HashMap<String, String>,
+    #[serde(default = "default_peak_hold")]
+    pub peak_hold: bool,
+    #[serde(default = "default_peak_freq")]
+    pub peak_freq: bool,
+    #[serde(default = "default_true")]
+    pub note_readout: bool,
+    #[serde(default)]
+    pub piano_mode: bool,
 }
 
 impl Default for PersistedState {
@@ -65,7 +85,8 @@ impl Default for PersistedState {
             light: false,
             theme: None,
             show_bg_spectrum: true,
-            char_stream: false,
+            braille_stream: false,
+            led_bars: false,
             show_radial: true,
             show_core_pulse: true,
             radial_scale: default_radial_scale(),
@@ -73,6 +94,11 @@ impl Default for PersistedState {
             eq_enabled: true,
             eq_gains: default_eq_gains(),
             eq_preset: default_eq_preset(),
+            lrc_map: HashMap::new(),
+            peak_hold: default_peak_hold(),
+            peak_freq: default_peak_freq(),
+            note_readout: true,
+            piano_mode: false,
         }
     }
 }
@@ -84,6 +110,8 @@ pub fn data_dir() -> PathBuf {
 }
 
 fn legacy_data_dir() -> PathBuf {
+    // Read-only fallback for playlists created before the product was renamed
+    // to Sonadial Player. New state is always written to SonadialPlayer.
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("NeonPlayerRS")

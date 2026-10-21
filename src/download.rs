@@ -22,6 +22,12 @@ pub enum DownloadEvent {
     Cancelled,
 }
 
+struct AudioSource {
+    url: String,
+    codec: String,
+    direct: bool,
+}
+
 pub fn spawn(
     input: String,
     output_dir: PathBuf,
@@ -123,7 +129,7 @@ fn download(
     .context("音频地址不是有效 JSON")?;
     check_api(&play, "获取音频地址失败")?;
 
-    let audio_url = best_audio_url(&play).ok_or_else(|| anyhow!("没有找到可下载的音频流"))?;
+    let source = best_audio_source(&play).ok_or_else(|| anyhow!("没有找到可下载的音轨"))?;
 
     fs::create_dir_all(output_dir).context("无法创建下载目录")?;
     let output = unique_output(output_dir, &safe_filename(title), "m4a");
@@ -137,7 +143,7 @@ fn download(
     ));
 
     status(sender, "DOWNLOADING");
-    let result = download_stream(&agent, &audio_url, &temp, sender, cancel);
+    let result = download_stream(&agent, &source.url, &temp, sender, cancel);
     if let Err(error) = result {
         let _ = fs::remove_file(&temp);
         return Err(error);
@@ -147,9 +153,29 @@ fn download(
         return Err(anyhow!("cancelled"));
     }
 
+    // Bilibili's normal AAC DASH tracks are already playable M4A/MP4 files.
+    // Validate one directly and move it into place, so ffmpeg is only used
+    // for non-AAC streams or containers that really need fixing up.
+    if source.direct {
+        status(sender, "CHECKING AUDIO");
+        let _ = sender.send(DownloadEvent::Progress(-1.0));
+        if crate::audio::probe_track(&temp).is_ok() {
+            if let Err(error) = move_into_place(&temp, &output) {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+            return Ok(output);
+        }
+        if cancel.load(Ordering::Relaxed) {
+            let _ = fs::remove_file(&temp);
+            return Err(anyhow!("cancelled"));
+        }
+    }
+
     status(sender, "CONVERTING AUDIO");
     let _ = sender.send(DownloadEvent::Progress(-1.0));
-    let converted = convert_audio(&temp, &output, cancel);
+    let converted = convert_audio(&temp, &output, cancel, source.direct)
+        .with_context(|| format!("{} 音轨无法直接保存，ffmpeg 兜底失败", source.codec));
     let _ = fs::remove_file(&temp);
     if let Err(error) = converted {
         let _ = fs::remove_file(&output);
@@ -207,7 +233,7 @@ fn check_api(value: &Value, context: &str) -> Result<()> {
     Ok(())
 }
 
-fn best_audio_url(play: &Value) -> Option<String> {
+fn best_audio_source(play: &Value) -> Option<AudioSource> {
     let data = play.get("data")?;
 
     if let Some(audio) = data
@@ -215,17 +241,30 @@ fn best_audio_url(play: &Value) -> Option<String> {
         .and_then(|dash| dash.get("audio"))
         .and_then(Value::as_array)
     {
-        if let Some(best) = audio
-            .iter()
-            .max_by_key(|item| item.get("bandwidth").and_then(Value::as_u64).unwrap_or(0))
-        {
-            if let Some(url) = best
-                .get("baseUrl")
-                .or_else(|| best.get("base_url"))
-                .and_then(Value::as_str)
-            {
-                return Some(url.to_owned());
+        let mut best_aac: Option<(&Value, u64)> = None;
+        let mut best_any: Option<(&Value, u64)> = None;
+        for item in audio {
+            let bandwidth = item.get("bandwidth").and_then(Value::as_u64).unwrap_or(0);
+            if best_any.map_or(true, |(_, best)| bandwidth > best) {
+                best_any = Some((item, bandwidth));
             }
+            let codec = item
+                .get("codecs")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let codecid = item.get("codecid").and_then(Value::as_u64);
+            let is_aac = codec.starts_with("mp4a") || (codec.is_empty() && codecid == Some(0));
+            if is_aac && best_aac.map_or(true, |(_, best)| bandwidth > best) {
+                best_aac = Some((item, bandwidth));
+            }
+        }
+
+        if let Some((item, _)) = best_aac {
+            return audio_source(item, true);
+        }
+        if let Some((item, _)) = best_any {
+            return audio_source(item, false);
         }
     }
 
@@ -234,7 +273,37 @@ fn best_audio_url(play: &Value) -> Option<String> {
         .and_then(|items| items.first())
         .and_then(|item| item.get("url"))
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+        .map(|url| AudioSource {
+            url: url.to_owned(),
+            codec: "durl".to_owned(),
+            direct: false,
+        })
+}
+
+fn audio_source(item: &Value, direct: bool) -> Option<AudioSource> {
+    let url = item
+        .get("baseUrl")
+        .or_else(|| item.get("base_url"))
+        .and_then(Value::as_str)?;
+    let codec = item
+        .get("codecs")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_owned();
+    Some(AudioSource {
+        url: url.to_owned(),
+        codec,
+        direct,
+    })
+}
+
+fn move_into_place(from: &Path, to: &Path) -> Result<()> {
+    if fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    fs::copy(from, to).context("无法保存音频文件")?;
+    let _ = fs::remove_file(from);
+    Ok(())
 }
 
 fn download_stream(
@@ -291,35 +360,37 @@ fn download_stream(
     Ok(())
 }
 
-fn convert_audio(input: &Path, output: &Path, cancel: &AtomicBool) -> Result<()> {
+fn convert_audio(input: &Path, output: &Path, cancel: &AtomicBool, allow_copy: bool) -> Result<()> {
     let input_text = input.to_string_lossy();
     let output_text = output.to_string_lossy();
-    let first = run_ffmpeg(
-        &[
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-i",
-            input_text.as_ref(),
-            "-map",
-            "0:a:0",
-            "-vn",
-            "-c:a",
-            "copy",
-            "-y",
-            output_text.as_ref(),
-        ],
-        cancel,
-    );
-    if first.is_ok() && output.is_file() {
-        return Ok(());
-    }
-    if cancel.load(Ordering::Relaxed) {
-        return Err(anyhow!("cancelled"));
+    if allow_copy {
+        let first = run_ffmpeg(
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-i",
+                input_text.as_ref(),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-c:a",
+                "copy",
+                "-y",
+                output_text.as_ref(),
+            ],
+            cancel,
+        );
+        if first.is_ok() && output.is_file() && crate::audio::probe_track(output).is_ok() {
+            return Ok(());
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(anyhow!("cancelled"));
+        }
+        let _ = fs::remove_file(output);
     }
 
-    let _ = fs::remove_file(output);
     run_ffmpeg(
         &[
             "-hide_banner",
@@ -342,10 +413,10 @@ fn convert_audio(input: &Path, output: &Path, cancel: &AtomicBool) -> Result<()>
     )
     .context("ffmpeg 转换失败，请确认 ffmpeg 在 PATH 中")?;
 
-    if output.is_file() {
+    if output.is_file() && crate::audio::probe_track(output).is_ok() {
         Ok(())
     } else {
-        Err(anyhow!("ffmpeg 没有生成音频文件"))
+        Err(anyhow!("ffmpeg 没有生成可播放的音频文件"))
     }
 }
 
