@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -26,6 +26,11 @@ use crate::eq::{EqParams, EqProcessor, NUM_BANDS};
 // enough to remove clicks but still feels immediate.
 const FADE_SECS: f32 = 0.12;
 
+// The output callback acknowledges a seek within a few milliseconds. If the
+// device stops calling back (unplugged, driver wedged) the decoder must not
+// wait forever for that acknowledgement.
+const SEEK_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Clone, Debug)]
 pub struct TrackInfo {
     pub path: PathBuf,
@@ -36,7 +41,11 @@ pub struct TrackInfo {
 
 #[derive(Debug)]
 enum Command {
-    Seek { target: f64, fallback: f64 },
+    Seek {
+        target: f64,
+        epoch: u64,
+        at_end: bool,
+    },
     Stop,
 }
 
@@ -44,11 +53,22 @@ struct Shared {
     paused: AtomicBool,
     volume_bits: AtomicU32,
     position_frames: AtomicU64,
+    // A seek stops production, asks the callback to flush, then resumes only
+    // after that flush is acknowledged. New samples must never be cleared.
     seek_epoch: AtomicU64,
+    seek_ready_epoch: AtomicU64,
+    seek_flushed_epoch: AtomicU64,
+    seek_position_frames: AtomicU64,
+    /// Epoch of the latest seek the demuxer refused. The callback adopts it
+    /// without discarding buffered audio.
+    seek_cancelled_epoch: AtomicU64,
     done: AtomicBool,
     stop: AtomicBool,
     out_rate: u32,
     eq: Mutex<Arc<EqParams>>,
+    /// Non-fatal playback notices (for example a rejected seek). Fatal decoder
+    /// errors still go through `AudioEngine::error`.
+    notice: Mutex<Option<(u64, String)>>,
 }
 
 pub struct AudioEngine {
@@ -65,6 +85,7 @@ pub struct AudioEngine {
     out_channels: usize,
     eq_gains: [f32; NUM_BANDS],
     eq_enabled: bool,
+    pending_seek: Option<(u64, f64)>,
 }
 
 impl Default for AudioEngine {
@@ -82,10 +103,15 @@ impl AudioEngine {
                 volume_bits: AtomicU32::new(0.78_f32.to_bits()),
                 position_frames: AtomicU64::new(0),
                 seek_epoch: AtomicU64::new(0),
+                seek_ready_epoch: AtomicU64::new(0),
+                seek_flushed_epoch: AtomicU64::new(0),
+                seek_position_frames: AtomicU64::new(0),
+                seek_cancelled_epoch: AtomicU64::new(0),
                 done: AtomicBool::new(true),
                 stop: AtomicBool::new(true),
                 out_rate: 48_000,
                 eq: Mutex::new(Arc::new(EqParams::flat(48_000))),
+                notice: Mutex::new(None),
             }),
             cmd_tx: None,
             decoder: None,
@@ -98,6 +124,7 @@ impl AudioEngine {
             out_channels: 2,
             eq_gains: [0.0; NUM_BANDS],
             eq_enabled: true,
+            pending_seek: None,
         }
     }
 
@@ -133,10 +160,15 @@ impl AudioEngine {
             volume_bits: AtomicU32::new(self.volume().to_bits()),
             position_frames: AtomicU64::new(0),
             seek_epoch: AtomicU64::new(0),
+            seek_ready_epoch: AtomicU64::new(0),
+            seek_flushed_epoch: AtomicU64::new(0),
+            seek_position_frames: AtomicU64::new(0),
+            seek_cancelled_epoch: AtomicU64::new(0),
             done: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             out_rate: self.out_rate,
             eq: Mutex::new(eq_params.clone()),
+            notice: Mutex::new(None),
         });
         *self.error.lock().unwrap() = None;
 
@@ -165,13 +197,29 @@ impl AudioEngine {
                 move |data: &mut [f32], _| {
                     data.fill(0.0);
 
-                    let epoch = cb_shared.seek_epoch.load(Ordering::Relaxed);
-                    if epoch != last_epoch {
+                    let epoch = cb_shared.seek_ready_epoch.load(Ordering::Acquire);
+                    if epoch > last_epoch {
                         out_cons.clear();
                         eq_processor = EqProcessor::new();
                         analysis_resampler.reset();
                         gain = 0.0;
+                        cb_shared.position_frames.store(
+                            cb_shared.seek_position_frames.load(Ordering::Relaxed),
+                            Ordering::Relaxed,
+                        );
                         last_epoch = epoch;
+                        cb_shared.seek_flushed_epoch.store(epoch, Ordering::Release);
+                    }
+                    let requested = cb_shared.seek_epoch.load(Ordering::Acquire);
+                    if requested != last_epoch {
+                        if cb_shared.seek_cancelled_epoch.load(Ordering::Acquire) == requested {
+                            // The demuxer refused this seek, so the queued
+                            // audio and the clock are both still valid: resume
+                            // without flushing anything.
+                            last_epoch = requested;
+                        } else {
+                            return;
+                        }
                     }
 
                     let paused = cb_shared.paused.load(Ordering::Relaxed);
@@ -303,6 +351,7 @@ impl AudioEngine {
         self.analysis = None;
         self.info = None;
         self.current_path = None;
+        self.pending_seek = None;
         self.shared.paused.store(true, Ordering::Relaxed);
         self.shared.done.store(true, Ordering::Relaxed);
         self.shared.position_frames.store(0, Ordering::Relaxed);
@@ -329,19 +378,28 @@ impl AudioEngine {
         self.shared.paused.load(Ordering::Relaxed)
     }
 
-    pub fn seek(&self, seconds: f64) {
+    pub fn seek(&mut self, seconds: f64) -> bool {
+        let Some(tx) = &self.cmd_tx else {
+            return false;
+        };
         let duration = self.duration();
         let target = seconds.clamp(0.0, duration.max(0.0));
-        let fallback = self.position();
-        self.shared.position_frames.store(
-            (target * self.out_rate as f64).round() as u64,
-            Ordering::Relaxed,
-        );
-        self.shared.seek_epoch.fetch_add(1, Ordering::Relaxed);
-        self.shared.done.store(false, Ordering::Relaxed);
-        if let Some(tx) = &self.cmd_tx {
-            let _ = tx.send(Command::Seek { target, fallback });
+        let epoch = self.shared.seek_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let at_end = duration > 0.0 && target >= duration;
+        if tx
+            .send(Command::Seek {
+                target,
+                epoch,
+                at_end,
+            })
+            .is_err()
+        {
+            *self.error.lock().unwrap() = Some("音频解码线程已停止，无法跳转".to_owned());
+            return false;
         }
+        self.shared.done.store(false, Ordering::Relaxed);
+        self.pending_seek = Some((epoch, target));
+        true
     }
 
     pub fn set_volume(&self, volume: f32) {
@@ -364,6 +422,11 @@ impl AudioEngine {
     }
 
     pub fn position(&self) -> f64 {
+        if let Some((epoch, target)) = self.pending_seek {
+            if self.shared.seek_flushed_epoch.load(Ordering::Acquire) != epoch {
+                return target;
+            }
+        }
         self.shared.position_frames.load(Ordering::Relaxed) as f64
             / self.shared.out_rate.max(1) as f64
     }
@@ -377,7 +440,14 @@ impl AudioEngine {
     }
 
     pub fn is_finished(&self) -> bool {
+        let resolved = self
+            .shared
+            .seek_flushed_epoch
+            .load(Ordering::Acquire)
+            .max(self.shared.seek_cancelled_epoch.load(Ordering::Acquire));
         self.info.is_some()
+            && !self.is_paused()
+            && self.shared.seek_epoch.load(Ordering::Acquire) == resolved
             && self.shared.done.load(Ordering::Relaxed)
             && self.position() >= (self.duration() - 0.35).max(0.0)
     }
@@ -400,8 +470,30 @@ impl AudioEngine {
         }
     }
 
-    pub fn take_error(&self) -> Option<String> {
-        self.error.lock().unwrap().take()
+    pub fn take_error(&mut self) -> Option<String> {
+        let error = self.error.lock().unwrap().take();
+        if error.is_some() {
+            // A dead decoder can never acknowledge `pending_seek`; drop it so
+            // the UI falls back to the shared clock instead of reporting a
+            // target that will never be reached.
+            self.pending_seek = None;
+        }
+        error
+    }
+
+    /// Non-fatal playback notice, such as a seek the demuxer refused.
+    pub fn take_notice(&mut self) -> Option<String> {
+        let notice = self.shared.notice.lock().unwrap().take();
+        if let Some((epoch, message)) = notice {
+            // The rejected seek never reached the clock, so stop reporting its
+            // target unless a newer seek has already been requested.
+            if matches!(self.pending_seek, Some((pending, _)) if pending <= epoch) {
+                self.pending_seek = None;
+            }
+            Some(message)
+        } else {
+            None
+        }
     }
 
     pub fn output_label(&self) -> String {
@@ -520,6 +612,23 @@ fn decode_loop(
     shared.done.store(true, Ordering::Relaxed);
 }
 
+/// Wait until the output callback has discarded the pre-seek audio and rebased
+/// the playback clock. Timing out means the device stopped calling back, which
+/// the caller reports as a fatal error instead of hanging the decoder thread.
+fn wait_for_seek_flush(shared: &Arc<Shared>, epoch: u64) -> Result<()> {
+    let started = Instant::now();
+    while shared.seek_flushed_epoch.load(Ordering::Acquire) != epoch {
+        if shared.stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if started.elapsed() >= SEEK_FLUSH_TIMEOUT {
+            return Err(anyhow!("音频输出未响应跳转，已停止播放"));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    Ok(())
+}
+
 fn decode_inner(
     path: &Path,
     shared: &Arc<Shared>,
@@ -567,8 +676,10 @@ fn decode_inner(
     // Accurate seeks land on the packet before the requested time. Drop the
     // leading decoded frames so the audible stream really starts at `target`.
     let mut trim_frames = 0_u64;
+    let mut epoch = 0_u64;
+    let mut eof = false;
 
-    loop {
+    'decode: loop {
         if shared.stop.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -576,50 +687,81 @@ fn decode_inner(
         loop {
             match rx.try_recv() {
                 Ok(Command::Stop) => return Ok(()),
-                Ok(Command::Seek { target, fallback }) => {
-                    let time = Time::try_from_secs_f64(target).unwrap_or(Time::ZERO);
-                    match format.seek(
-                        SeekMode::Accurate,
-                        SeekTo::Time {
-                            time,
-                            track_id: Some(track_id),
-                        },
-                    ) {
-                        Ok(seeked) => {
-                            // Accurate mode seeks to the packet at or before the
-                            // requested time. Keep the requested position and
-                            // trim the leading frames so audio does not lag it.
-                            let actual = time_base
-                                .and_then(|tb| tb.calc_time(seeked.actual_ts))
-                                .map(|time| time.as_secs_f64())
-                                .unwrap_or(target)
-                                .clamp(0.0, target);
-                            trim_frames =
-                                ((target - actual).max(0.0) * input_rate as f64).round() as u64;
+                Ok(Command::Seek {
+                    target,
+                    epoch: requested_epoch,
+                    at_end,
+                }) => {
+                    if requested_epoch != shared.seek_epoch.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let seek = if at_end {
+                        // Some demuxers reject a timestamp exactly at EOF.
+                        // Flushing to the end needs no packet from the file.
+                        Ok(target)
+                    } else {
+                        let time = Time::try_from_secs_f64(target).unwrap_or(Time::ZERO);
+                        format
+                            .seek(
+                                SeekMode::Accurate,
+                                SeekTo::Time {
+                                    time,
+                                    track_id: Some(track_id),
+                                },
+                            )
+                            .map(|seeked| {
+                                time_base
+                                    .and_then(|tb| tb.calc_time(seeked.actual_ts))
+                                    .map(|time| time.as_secs_f64())
+                                    .unwrap_or(target)
+                                    .clamp(0.0, target)
+                            })
+                            .map_err(|err| anyhow!("无法跳转到指定播放位置：{err}"))
+                    };
+
+                    match seek {
+                        Ok(actual) => {
+                            trim_frames = ((target - actual) * input_rate as f64).round() as u64;
                             decoder.reset();
                             resampler.reset();
-                            shared.position_frames.store(
+                            epoch = requested_epoch;
+                            eof = at_end;
+                            shared.done.store(eof, Ordering::Relaxed);
+                            shared.seek_position_frames.store(
                                 (target * shared.out_rate as f64).round() as u64,
                                 Ordering::Relaxed,
                             );
-                            shared.seek_epoch.fetch_add(1, Ordering::Relaxed);
-                            shared.done.store(false, Ordering::Relaxed);
+                            shared.seek_ready_epoch.store(epoch, Ordering::Release);
+                            // The callback owns both the queue consumer and the
+                            // playback clock. It must discard old audio and
+                            // rebase that clock before we may enqueue new audio.
+                            wait_for_seek_flush(shared, epoch)?;
+                            if shared.stop.load(Ordering::Relaxed) {
+                                return Ok(());
+                            }
                         }
-                        Err(_) => {
-                            // The decoder is still at the old packet. Restore
-                            // the old position instead of claiming the seek
-                            // succeeded.
-                            trim_frames = 0;
-                            shared.position_frames.store(
-                                (fallback.max(0.0) * shared.out_rate as f64).round() as u64,
-                                Ordering::Relaxed,
-                            );
+                        Err(err) => {
+                            // The demuxer stayed on the old packet, so the
+                            // buffered audio is still valid. Tell the callback
+                            // to resume without flushing and leave the clock
+                            // alone; only the UI has to drop the seek target.
+                            epoch = requested_epoch;
+                            shared.seek_cancelled_epoch.store(epoch, Ordering::Release);
+                            shared.done.store(eof, Ordering::Relaxed);
+                            *shared.notice.lock().unwrap() = Some((epoch, err.to_string()));
                         }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
+        }
+
+        if eof || epoch != shared.seek_epoch.load(Ordering::Acquire) {
+            // Keep servicing seeks after EOF, including when the final output
+            // buffer is still playing or playback is paused near the end.
+            thread::sleep(Duration::from_millis(10));
+            continue;
         }
 
         match format.next_packet() {
@@ -648,14 +790,15 @@ fn decode_inner(
                             } else {
                                 left
                             };
-                            if !resampler.push(left, right, out, shared) {
-                                return Ok(());
+                            if !resampler.push(left, right, out, shared, epoch) {
+                                continue 'decode;
                             }
                         }
                     }
                     Err(SymError::DecodeError(_)) => continue,
                     Err(SymError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => {
-                        break;
+                        eof = true;
+                        shared.done.store(true, Ordering::Relaxed);
                     }
                     Err(SymError::ResetRequired) => {
                         decoder.reset();
@@ -663,16 +806,20 @@ fn decode_inner(
                     Err(err) => return Err(err.into()),
                 }
             }
-            Ok(None) => break,
-            Err(SymError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Ok(None) => {
+                eof = true;
+                shared.done.store(true, Ordering::Relaxed);
+            }
+            Err(SymError::IoError(err)) if err.kind() == ErrorKind::UnexpectedEof => {
+                eof = true;
+                shared.done.store(true, Ordering::Relaxed);
+            }
             Err(SymError::ResetRequired) => {
                 decoder.reset();
             }
             Err(err) => return Err(err.into()),
         }
     }
-
-    Ok(())
 }
 
 struct LinearResampler {
@@ -707,9 +854,10 @@ impl LinearResampler {
         right: f32,
         out: &mut HeapProd<f32>,
         shared: &Arc<Shared>,
+        epoch: u64,
     ) -> bool {
         if self.identity {
-            return push_stereo(out, left, right, shared);
+            return push_stereo(out, left, right, shared, epoch);
         }
 
         let current_index = self.frame_index as f64;
@@ -718,13 +866,13 @@ impl LinearResampler {
                 let t = ((self.next_pos - (current_index - 1.0)).clamp(0.0, 1.0)) as f32;
                 let out_left = prev_left + (left - prev_left) * t;
                 let out_right = prev_right + (right - prev_right) * t;
-                if !push_stereo(out, out_left, out_right, shared) {
+                if !push_stereo(out, out_left, out_right, shared, epoch) {
                     return false;
                 }
                 self.next_pos += self.step;
             }
         } else {
-            if !push_stereo(out, left, right, shared) {
+            if !push_stereo(out, left, right, shared, epoch) {
                 return false;
             }
             self.next_pos = self.step;
@@ -786,13 +934,22 @@ impl MonoResampler {
     }
 }
 
-fn push_stereo(out: &mut HeapProd<f32>, left: f32, right: f32, shared: &Arc<Shared>) -> bool {
-    while out.vacant_len() < 2 {
-        if shared.stop.load(Ordering::Relaxed) {
+fn push_stereo(
+    out: &mut HeapProd<f32>,
+    left: f32,
+    right: f32,
+    shared: &Arc<Shared>,
+    epoch: u64,
+) -> bool {
+    loop {
+        if shared.stop.load(Ordering::Relaxed) || shared.seek_epoch.load(Ordering::Acquire) != epoch
+        {
             return false;
+        }
+        if out.vacant_len() >= 2 {
+            let _ = out.push_slice(&[left, right]);
+            return true;
         }
         thread::sleep(Duration::from_millis(2));
     }
-    let _ = out.push_slice(&[left, right]);
-    true
 }
