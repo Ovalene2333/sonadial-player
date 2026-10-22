@@ -30,10 +30,6 @@ fn default_peak_hold() -> bool {
     true
 }
 
-fn default_peak_freq() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedState {
     #[serde(default)]
@@ -82,10 +78,6 @@ pub struct PersistedState {
     pub lrc_map: HashMap<String, String>,
     #[serde(default = "default_peak_hold")]
     pub peak_hold: bool,
-    #[serde(default = "default_peak_freq")]
-    pub peak_freq: bool,
-    #[serde(default = "default_true")]
-    pub note_readout: bool,
     #[serde(default = "default_true")]
     pub show_lyrics: bool,
     #[serde(default)]
@@ -115,8 +107,6 @@ impl Default for PersistedState {
             eq_preset: default_eq_preset(),
             lrc_map: HashMap::new(),
             peak_hold: default_peak_hold(),
-            peak_freq: default_peak_freq(),
-            note_readout: true,
             show_lyrics: true,
             piano_mode: false,
         }

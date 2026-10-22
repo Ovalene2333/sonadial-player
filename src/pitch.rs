@@ -56,17 +56,12 @@ pub fn pitch_class_name(pitch_class: u8) -> &'static str {
 }
 
 #[derive(Clone, Copy, Default, Debug)]
+#[allow(dead_code)] // kept for note-level analysis; the UI no longer prints it
 pub struct NoteInfo {
     pub midi: u8,
     /// Deviation from equal temperament in cents, clamped to +/-50.
     pub cents: f32,
     pub level: f32,
-}
-
-impl NoteInfo {
-    pub fn label(&self) -> String {
-        format!("{} {:+}c", midi_name(self.midi), self.cents.round() as i32)
-    }
 }
 
 #[derive(Clone)]

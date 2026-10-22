@@ -269,8 +269,6 @@ pub struct SonadialApp {
     braille_stream: bool,
     led_bars: bool,
     peak_hold: bool,
-    peak_freq: bool,
-    note_readout: bool,
     show_lyrics: bool,
     piano_mode: bool,
     piano_history: VecDeque<NoteFrame>,
@@ -442,8 +440,6 @@ impl SonadialApp {
             braille_stream: dot_style,
             led_bars: dot_style,
             peak_hold: state.peak_hold,
-            peak_freq: state.peak_freq,
-            note_readout: state.note_readout,
             show_lyrics: state.show_lyrics,
             piano_mode: state.piano_mode,
             piano_history: VecDeque::new(),
@@ -2040,8 +2036,6 @@ impl SonadialApp {
                 .map(|(track, lrc)| (track.clone(), lrc.to_string_lossy().to_string()))
                 .collect(),
             peak_hold: self.peak_hold,
-            peak_freq: self.peak_freq,
-            note_readout: self.note_readout,
             show_lyrics: self.show_lyrics,
             piano_mode: self.piano_mode,
         };
@@ -2504,16 +2498,7 @@ impl SonadialApp {
                         mono(10.0),
                         theme::text_dim(),
                     );
-                    let mut status = format!("{elapsed} / {total}");
-                    if self.note_readout {
-                        if let Some(note) = self.analyzer.pitch().top {
-                            let polyphony = self.analyzer.pitch().polyphony;
-                            status.push_str(&format!("   {}", note.label()));
-                            if polyphony > 1 {
-                                status.push_str(&format!(" x{polyphony}"));
-                            }
-                        }
-                    }
+                    let status = format!("{elapsed} / {total}");
                     painter.text(
                         Pos2::new(rect.right() - 18.0, rect.top() + TOP_LABEL_Y),
                         Align2::RIGHT_CENTER,
@@ -2563,39 +2548,6 @@ impl SonadialApp {
                         mono(12.0),
                         theme::text_dim(),
                     );
-                    if self.peak_freq {
-                        let hz = self.analyzer.dominant_hz();
-                        if hz >= 20.0 {
-                            painter.text(
-                                Pos2::new(rect.right() - 18.0, rect.top() + TOP_LABEL_Y + 16.0),
-                                Align2::RIGHT_CENTER,
-                                format!("PEAK {:.0} HZ / {}", hz, note_name(hz)),
-                                mono(10.0),
-                                theme::text_dim(),
-                            );
-                        }
-                    }
-                    if self.note_readout {
-                        if let Some(note) = self.analyzer.pitch().top {
-                            let polyphony = self.analyzer.pitch().polyphony;
-                            let label = if polyphony > 1 {
-                                format!("NOTE {} / x{}", note.label(), polyphony)
-                            } else {
-                                format!("NOTE {}", note.label())
-                            };
-                            painter.text(
-                                Pos2::new(rect.right() - 18.0, rect.top() + TOP_LABEL_Y + 32.0),
-                                Align2::RIGHT_CENTER,
-                                label,
-                                mono(10.0),
-                                if note.level > 0.5 {
-                                    theme::text_hi()
-                                } else {
-                                    theme::text_dim()
-                                },
-                            );
-                        }
-                    }
 
                     if self.show_lyrics {
                         self.paint_lyrics(painter, rect);
@@ -3803,41 +3755,7 @@ impl SonadialApp {
                                             self.peak_hold = !self.peak_hold;
                                             self.dirty = true;
                                         }
-                                        if tui_button(
-                                            ui,
-                                            &toggle_label("PEAK FREQ", self.peak_freq),
-                                            toggle_w,
-                                        )
-                                        .clicked()
-                                        {
-                                            self.peak_freq = !self.peak_freq;
-                                            self.dirty = true;
-                                        }
                                     });
-                                    ui.add_space(tokens::SPACE_3);
-                                    ui.label(
-                                        RichText::new("NOTES")
-                                            .font(mono(12.0))
-                                            .color(theme::text_dim()),
-                                    );
-                                    ui.add_space(tokens::SPACE_1);
-                                    ui.horizontal(|ui| {
-                                        if tui_button(
-                                            ui,
-                                            &toggle_label("NOTE READOUT", self.note_readout),
-                                            toggle_w,
-                                        )
-                                        .clicked()
-                                        {
-                                            self.note_readout = !self.note_readout;
-                                            self.dirty = true;
-                                        }
-                                    });
-                                    ui.label(
-                                        RichText::new("SOLO PIANO / CLEAR MIXES")
-                                            .font(mono(10.0))
-                                            .color(theme::text_dim()),
-                                    );
                                     ui.add_space(tokens::SPACE_3);
                                     ui.label(
                                         RichText::new("PARAMETERS")
@@ -4056,19 +3974,6 @@ impl eframe::App for SonadialApp {
         self.cancel_note_analysis();
         self.save_state();
     }
-}
-
-fn note_name(hz: f32) -> String {
-    if !hz.is_finite() || hz <= 0.0 {
-        return "---".to_owned();
-    }
-    const NAMES: [&str; 12] = [
-        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-    ];
-    let midi = (69.0 + 12.0 * (hz / 440.0).log2()).round() as i32;
-    let name = NAMES[midi.rem_euclid(12) as usize];
-    let octave = midi.div_euclid(12) - 1;
-    format!("{name}{octave}")
 }
 
 fn entry_for_path(path: PathBuf, lrc: Option<PathBuf>) -> TrackEntry {

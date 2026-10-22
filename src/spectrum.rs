@@ -20,8 +20,6 @@ const PEAK_DECAY: f32 = 0.995;
 // still uses the existing display blend, so the fall remains soft as well.
 const BAR_ATTACK: f32 = 0.28;
 const PEAK_FALL_DB_PER_SEC: f32 = 16.0;
-const DOMINANT_MIN_HZ: f32 = 30.0;
-const DOMINANT_MAX_HZ: f32 = 8_000.0;
 #[derive(Clone, Copy, Default, Debug)]
 pub struct VisualState {
     pub energy: f32,
@@ -48,7 +46,6 @@ pub struct SpectrumEngine {
     bar_end: Vec<usize>,
     bars: Vec<f32>,
     peaks: Vec<f32>,
-    dominant_hz: f32,
     chunk_db: Vec<f32>,
     display: Vec<f32>,
     last_db: Vec<f32>,
@@ -103,7 +100,6 @@ impl SpectrumEngine {
             bar_end: edges[1..].to_vec(),
             bars: vec![0.0; NUM_BARS],
             peaks: vec![0.0; NUM_BARS],
-            dominant_hz: 0.0,
             chunk_db: vec![0.0; NUM_BARS],
             display: vec![0.0; NUM_BARS],
             last_db: vec![0.0; NUM_BARS],
@@ -127,7 +123,6 @@ impl SpectrumEngine {
         self.chunk_len = 0;
         self.bars.fill(0.0);
         self.peaks.fill(0.0);
-        self.dominant_hz = 0.0;
         self.last_db.fill(0.0);
         self.has_last = false;
         self.beat.reset();
@@ -157,7 +152,6 @@ impl SpectrumEngine {
         self.chunk_len = 0;
         self.bars.fill(0.0);
         self.peaks.fill(0.0);
-        self.dominant_hz = 0.0;
         self.last_db.fill(0.0);
         self.has_last = false;
         self.has_new = false;
@@ -182,10 +176,6 @@ impl SpectrumEngine {
             if *peak < 0.2 {
                 *peak = 0.0;
             }
-        }
-        self.dominant_hz *= (-(dt.max(0.0)) / 0.25).exp();
-        if self.dominant_hz < DOMINANT_MIN_HZ {
-            self.dominant_hz = 0.0;
         }
         self.last_db.fill(0.0);
         self.has_last = false;
@@ -256,56 +246,12 @@ impl SpectrumEngine {
         for (bar, peak) in self.bars.iter().zip(self.peaks.iter_mut()) {
             *peak = (*peak - fall).max(*bar);
         }
-        let bin_hz = ANALYSIS_RATE as f32 / FFT_SIZE as f32;
-        let min_bin = (DOMINANT_MIN_HZ / bin_hz).ceil() as usize;
-        let max_bin = ((DOMINANT_MAX_HZ / bin_hz).floor() as usize).min(self.mag.len() - 1);
-        let mut best_index = min_bin;
-        let mut best = 0.0;
-        for (index, value) in self.mag.iter().enumerate().take(max_bin + 1).skip(min_bin) {
-            if *value > best {
-                best = *value;
-                best_index = index;
-            }
-        }
-        let detected = if best > 1e-4 {
-            let left = self
-                .mag
-                .get(best_index.saturating_sub(1))
-                .copied()
-                .unwrap_or(best);
-            let right = self.mag.get(best_index + 1).copied().unwrap_or(best);
-            let denominator = left - 2.0 * best + right;
-            let offset = if denominator.abs() > 1e-12 {
-                (0.5 * (left - right) / denominator).clamp(-0.5, 0.5)
-            } else {
-                0.0
-            };
-            (best_index as f32 + offset) * bin_hz
-        } else {
-            0.0
-        };
-        self.dominant_hz = if detected > 0.0 {
-            if self.dominant_hz > 0.0 {
-                self.dominant_hz + (detected - self.dominant_hz) * 0.35
-            } else {
-                detected
-            }
-        } else {
-            self.dominant_hz * 0.88
-        };
-        if self.dominant_hz < DOMINANT_MIN_HZ {
-            self.dominant_hz = 0.0;
-        }
         self.has_new = true;
         self.beat_state = beat_state;
     }
 
     pub fn peaks(&self) -> &[f32] {
         &self.peaks
-    }
-
-    pub fn dominant_hz(&self) -> f32 {
-        self.dominant_hz
     }
 
     pub fn tick(&mut self, playing: bool, external_beat: Option<(u64, f32)>) -> VisualState {
