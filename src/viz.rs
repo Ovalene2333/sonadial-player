@@ -1203,6 +1203,8 @@ pub fn paint_piano_style(
         Stroke::new(1.0, theme::alpha(theme::ink(130), 190)),
     );
 
+    paint_piano_watermark(painter, roll);
+
     // Once offline transcription is ready, draw clean note events. Until then
     // fall back to the real-time activity trail.
     if let Some(events) = events {
@@ -1345,6 +1347,21 @@ pub fn paint_piano_style(
             theme::alpha(theme::ink(135), 230),
         );
     }
+}
+
+/// Large, faint notice drawn behind the piano roll so the experimental state of
+/// the mode reads even when the scene is mostly empty.
+fn paint_piano_watermark(painter: &Painter, roll: Rect) {
+    let size = (roll.height() * 0.20)
+        .min(roll.width() / 9.0)
+        .clamp(20.0, 72.0);
+    painter.text(
+        roll.center(),
+        Align2::CENTER_CENTER,
+        "ON DEV TESTING",
+        FontId::new(size, FontFamily::Monospace),
+        theme::alpha(theme::ink(210), 50),
+    );
 }
 
 fn paint_piano_frame(painter: &Painter, left: f32, top: f32, right: f32, bottom: f32) {
