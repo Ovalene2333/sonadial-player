@@ -5,6 +5,7 @@
 
 mod app;
 mod audio;
+mod auto_theme;
 mod beat;
 mod beat_config;
 mod decode;
@@ -14,9 +15,12 @@ mod eq;
 mod lyrics;
 mod notes;
 mod pitch;
+mod song_type;
+mod sound_profile;
 mod spectrum;
 mod storage;
 mod theme;
+mod theme_library;
 mod viz;
 
 use std::io::Write;

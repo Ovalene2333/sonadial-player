@@ -17,6 +17,7 @@ use rustfft::FftPlanner;
 use serde::{Deserialize, Serialize};
 
 use crate::beat_config::BeatConfig;
+use crate::sound_profile::{BandCurves, ProfileFrames, SoundProfile};
 use crate::storage;
 
 const ANALYSIS_RATE: u32 = 22_050;
@@ -27,13 +28,15 @@ const LOW_HIGH_HZ: f32 = 210.0;
 const WIDE_HIGH_HZ: f32 = 8_000.0;
 const SOFT_HIGH_HZ: f32 = 2_000.0;
 // Bump when the offline detector changes; old cache entries are ignored.
-const ANALYSIS_VERSION: u32 = 12;
+// 13 added the sound profile, 14 widened it for the song type.
+const ANALYSIS_VERSION: u32 = 14;
 const FRAME_CENTER_SECONDS: f64 = 0.5 * FRAME_SIZE as f64 / ANALYSIS_RATE as f64;
 
 #[derive(Clone, Debug, Default)]
 pub struct BeatAnalysis {
     pub beats: Vec<(f64, f32)>,
     pub bpm: f32,
+    pub profile: Option<SoundProfile>,
 }
 
 struct BandCurve {
@@ -74,6 +77,8 @@ struct BeatCacheEntry {
     beats: Vec<(f64, f32)>,
     #[serde(default)]
     bpm: f32,
+    #[serde(default)]
+    profile: Option<SoundProfile>,
 }
 
 static CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -87,6 +92,7 @@ pub fn analyze_file(path: &Path, cancel: &AtomicBool, config: &BeatConfig) -> Re
         return Ok(BeatAnalysis {
             beats: entry.beats,
             bpm: entry.bpm,
+            profile: entry.profile,
         });
     }
 
@@ -119,6 +125,7 @@ fn analyze_pcm(samples: &[f32], cancel: &AtomicBool, config: &BeatConfig) -> Res
     let wide_end = ((WIDE_HIGH_HZ / bin_hz).floor() as usize).min(bins - 1);
     let mid_start = (low_end + 1).min(bins - 1);
     let mid_end = ((SOFT_HIGH_HZ / bin_hz).floor() as usize).min(bins - 1);
+    let high_start = ((SOFT_HIGH_HZ / bin_hz).ceil() as usize).min(wide_end);
     if low_start > low_end || mid_start > mid_end {
         return Ok(BeatAnalysis::default());
     }
@@ -136,27 +143,40 @@ fn analyze_pcm(samples: &[f32], cancel: &AtomicBool, config: &BeatConfig) -> Res
     let mut low_energy = Vec::with_capacity(frame_count);
     let mut wide_energy = Vec::with_capacity(frame_count);
     let mut mid_energy = Vec::with_capacity(frame_count);
+    let mut high_energy = Vec::with_capacity(frame_count);
+    let mut frame_power = Vec::with_capacity(frame_count);
+    let mut profile_frames = ProfileFrames::with_capacity(frame_count);
 
     for frame in 0..frame_count {
         if frame % 512 == 0 && cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("beat analysis cancelled"));
         }
         let start = frame * HOP_SIZE;
+        let mut square_sum = 0.0;
         for index in 0..FRAME_SIZE {
-            buffer[index] = Complex::new(samples[start + index] * window[index], 0.0);
+            let sample = samples[start + index];
+            square_sum += sample * sample;
+            buffer[index] = Complex::new(sample * window[index], 0.0);
         }
+        frame_power.push(square_sum / FRAME_SIZE as f32);
         fft.process(&mut buffer);
+        profile_frames.push(&samples[start..start + FRAME_SIZE], &buffer, bin_hz);
 
         let mut low = 0.0;
         let mut wide = 0.0;
         let mut mid = 0.0;
+        let mut high = 0.0;
         for bin in low_start..=low_end {
             let value = buffer[bin];
             low += value.re * value.re + value.im * value.im;
         }
         for bin in wide_start..=wide_end {
             let value = buffer[bin];
-            wide += value.re * value.re + value.im * value.im;
+            let power = value.re * value.re + value.im * value.im;
+            wide += power;
+            if bin >= high_start {
+                high += power;
+            }
         }
         for bin in mid_start..=mid_end {
             let value = buffer[bin];
@@ -165,6 +185,7 @@ fn analyze_pcm(samples: &[f32], cancel: &AtomicBool, config: &BeatConfig) -> Res
         low_energy.push(low);
         wide_energy.push(wide);
         mid_energy.push(mid);
+        high_energy.push(high);
     }
 
     let Some(low) = band_curve(&low_energy) else {
@@ -172,10 +193,25 @@ fn analyze_pcm(samples: &[f32], cancel: &AtomicBool, config: &BeatConfig) -> Res
     };
     let wide = band_curve(&wide_energy).unwrap_or_else(|| zero_band(frame_count));
     let mid = band_curve(&mid_energy).unwrap_or_else(|| zero_band(frame_count));
+    let high = band_curve(&high_energy).unwrap_or_else(|| zero_band(frame_count));
 
     let low_flux = rectified_flux(&low.curve);
     let wide_flux = rectified_flux(&wide.curve);
     let mid_flux = rectified_flux(&mid.curve);
+    let profile = profile_frames.finish(
+        &BandCurves {
+            power: &frame_power,
+            low: &low_energy,
+            mid: &mid_energy,
+            wide: &wide_energy,
+            high: &high_energy,
+            low_flux: &low_flux,
+            mid_flux: &mid_flux,
+            wide_flux: &wide_flux,
+            high_flux: &rectified_flux(&high.curve),
+        },
+        frame_rate,
+    );
     let low_span = span(&low_flux);
     let wide_span = span(&wide_flux);
     let mid_span = span(&mid_flux);
@@ -313,7 +349,11 @@ fn analyze_pcm(samples: &[f32], cancel: &AtomicBool, config: &BeatConfig) -> Res
         })
         .collect::<Vec<(f64, f32)>>();
     let bpm = estimate_bpm(&normal_frames, frame_rate);
-    Ok(BeatAnalysis { beats, bpm })
+    Ok(BeatAnalysis {
+        beats,
+        bpm,
+        profile,
+    })
 }
 
 fn zero_band(frame_count: usize) -> BandCurve {
@@ -496,7 +536,7 @@ fn pick_peaks(
     picked
 }
 
-fn percentile(values: &[f32], q: f32) -> f32 {
+pub(crate) fn percentile(values: &[f32], q: f32) -> f32 {
     if values.is_empty() {
         return 0.0;
     }
@@ -638,6 +678,7 @@ fn store_cache_entry(
             config_hash,
             beats: analysis.beats.clone(),
             bpm: analysis.bpm,
+            profile: analysis.profile,
         },
     );
     prune_cache(&mut cache);

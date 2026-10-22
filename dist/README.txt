@@ -89,9 +89,38 @@ VISUALS 的 STYLE 提供两种互斥风格：DEFAULT 使用平滑圆心、平滑
 频谱高度慢速上升、保持原有平滑下落；暂停或停止播放时，频谱柱会逐渐
 归零、圆心能量环自然衰减，恢复播放时直接按实时数据出现，不做整体
 淡入淡出。
-SYS 面板中可切换 12 套主题（四黑四白三彩一渐变）：MONO / PAPER / SLATE /
-MOSS / DUSK / SAND / FOG / ROSE / BLUSH / MINT / AMBER / AURORA。
-AURORA 为渐变背景；BLUSH、MINT、AMBER 为彩色主题。可单独开关背景频谱、
+SYS 面板的 THEME 页内置 21 套主题，按类别分组，每组深色在前、浅色在后：
+- MONO：MONO / PAPER（纯黑白灰）
+- TINT：SLATE / MOSS / DUSK / SAND / FOG / ROSE（单一低饱和色调）
+- COLOR：BERRY / JADE / COBALT / BLUSH / MINT / AMBER（单一彩色）
+- GRADIENT：AURORA / NEBULA / SUNSET / OCEAN / SHERBET / OPAL / MEADOW（四角多色渐变）
+- CUSTOM：自定义主题（见下方 themes.json）
+选中任意内置主题后点 CUSTOMIZE 会复制一份到 CUSTOM 并打开编辑器：可改名称、
+背景（纯色 / 双色斜向渐变 / 四角渐变）、强调色、频谱着色比例、深浅模式
+（AUTO 按背景亮度自动判断），改动实时生效；文字颜色会自动提亮或压暗以保证
+可读性。颜色用 #RRGGBB 输入。主题按名称保存，旧版本的主题选择会自动迁移。
+THEME 页最上方的 AUTO DARK / AUTO LIGHT 只选明暗，配色按当前歌曲的
+类型生成，始终是四角渐变。类型由音频特征判断（响度、频段比例、
+频谱平坦度与对比度、节奏规律性等），共 7 种：
+- PIANO：靛蓝、钢蓝，最安静
+- EPIC：海军蓝、青绿配余烬金
+- BALLAD：梅紫、藕荷、玫瑰
+- POP：糖果紫、水蓝、粉、桃
+- ROCK：炭灰配深红、焦橙
+- ELEC：霓虹蓝、青、品红、紫
+- PHONK：近黑紫配血红，略暗（嘻哈 / trap 一般也归这里）
+同一类型内再按本曲和同类歌相比的四项特征做变化，配色家族不变：
+- TONE（高频多还是低频多）：整体色相最多转约 14°
+- DRIVE（响度与力度）：饱和度和光晕 ±22%
+- PULSE（节奏是否规整）：渐变方向最多转约 36°，亮角随之移动
+- CLARITY（高频干净还是偏噪）：两条对角线的色相各向相反方向偏约 12°
+所有类型共用同一套明暗布局，切歌换类型时主要变的是色相，约 1.5 秒淡入。
+每首歌只在节拍分析完成后算一次，有缓存的歌几乎立即生效。分类是在本地
+曲库上离线拟合的，大约六成多判对，判错时多落在相近类型（POP / ELEC、
+EPIC / BALLAD）。CURRENT 下一行显示本曲判出的类型和这四项的数值。
+AUTO 下点 CUSTOMIZE 会把当前生成的配色存成一个自定义主题（名称如
+AUTO PHONK）；点任意其他主题即退出 AUTO，之前手选的主题仍会保留。
+可单独开关背景频谱、
 圆频谱、圆心跳动和歌词层，并调节圆频谱尺寸。PEAK HOLD 只在圆频谱上绘制缓慢下落的
 峰值帽，不会影响背景频谱；PEAK FREQ 在右上角显示当前主频和近似音名。
 底部音量条在当前曲目上显示为 TRK，每首歌的音量会单独记住；
@@ -108,6 +137,7 @@ AURORA 为渐变背景；BLUSH、MINT、AMBER 为彩色主题。可单独开关�
 --------
 播放列表、默认/曲目音量、EQ、主题与显示设置：%APPDATA%\SonadialPlayer\state.json
 节拍参数：      %APPDATA%\SonadialPlayer\beat.json（修改后重启）
+自定义主题：    %APPDATA%\SonadialPlayer\themes.json（THEME 页 RELOAD 即可生效）
 崩溃日志：      %APPDATA%\SonadialPlayer\crash.log
 下载目录：      %USERPROFILE%\Music\SonadialPlayer
 
@@ -129,11 +159,40 @@ AURORA 为渐变背景；BLUSH、MINT、AMBER 为彩色主题。可单独开关�
 - heavy_strength_min / heavy_strength_max / low_share_min / sensitivity：重拍强度与检测细调
 修改算法参数后旧分析缓存会自动失效；只改 short_visual / short_ring_strength 不会重新分析。
 
+自定义主题（themes.json）
+------------------------
+第一次在 THEME 页 CUSTOMIZE 时自动生成，也可以手写。示例：
+{
+  "themes": [
+    {
+      "name": "MY AURORA",
+      "background": ["#081A20", "#191825", "#3C1430", "#2B162B"],
+      "accent": "#AA8CDC",
+      "tint": 0.34,
+      "dark": true,
+      "colors": { "text_hi": "#F0E8FF" }
+    }
+  ]
+}
+- name：显示名称，不能和其他主题重名（不区分大小写），UI 里最长 16 字符
+- background：1 个颜色 = 纯色；2 个 = 左上到右下斜向渐变；
+  4 个 = 四角渐变，顺序为左上、右上、右下、左下
+- accent：强调色，用于频谱着色，并轻微染色文字、线条和警示色
+- tint：频谱中强调色的占比，0–1（默认 0.34；UI 调节范围 0–60%）
+- dark：可省略；省略时按背景亮度自动判断深浅
+- colors：可选，逐项覆盖推导出的颜色，可用字段：bg、bg_deep、surface、
+  surface_hi、surface_sunken、text_hi、text、text_dim、line、danger
+  （覆盖的颜色不做可读性修正；编辑器里可一键 CLEAR）
+手动修改后在 THEME 页点 RELOAD。文件格式错误时会提示行列号，自定义主题
+暂时只读，修好再 RELOAD；单个主题有问题（重名、背景颜色数量不对）只跳过
+该条并在 THEME 页提示。程序运行期间如果文件被外部改过，UI 的修改不会
+覆盖它，需要先 RELOAD。
+
 当前范围
 --------
 已完成：本地播放、解码、进度/跳转、音量、播放列表、循环/随机、
 TUI 外壳、高清频谱、背景 LED 频谱、圆心能量环、拖放、
-12 套低饱和度主题、频谱显示开关、圆频谱尺寸调节、音频淡入淡出、停止渐隐、
+21 套分组主题与自定义主题编辑、按歌曲生成的 AUTO 主题、频谱显示开关、圆频谱尺寸调节、音频淡入淡出、停止渐隐、
 曲目右键菜单：播放、下一首播放、导入/清除 LRC、打开文件位置、从列表移除、永久删除。
 随机播放每次启动抽取一个固定随机顺序，下一首和上一首沿同一顺序前后移动；
 “下一首播放”队列优先于播放模式，且会跳过已移除的文件。

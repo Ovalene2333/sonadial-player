@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::auto_theme::Mood;
+
 fn default_volume() -> f32 {
     0.78
 }
@@ -42,8 +44,20 @@ pub struct PersistedState {
     pub volume: f32,
     #[serde(default)]
     pub light: bool,
+    /// Built-in index from before themes were saved by name; still written
+    /// for built-ins so older builds keep the choice.
     #[serde(default)]
     pub theme: Option<usize>,
+    #[serde(default)]
+    pub theme_name: Option<String>,
+    /// AUTO theme: `Some(true)` dark, `Some(false)` light, `None` off. The
+    /// manual `theme_name` is kept so leaving AUTO restores it.
+    #[serde(default)]
+    pub auto_theme: Option<bool>,
+    /// Mood the AUTO look was last generated from, shown at startup until
+    /// the current track is analysed.
+    #[serde(default)]
+    pub auto_mood: Option<Mood>,
     #[serde(default = "default_true")]
     pub show_bg_spectrum: bool,
     #[serde(default)]
@@ -86,6 +100,9 @@ impl Default for PersistedState {
             volume: default_volume(),
             light: false,
             theme: None,
+            theme_name: None,
+            auto_theme: None,
+            auto_mood: None,
             show_bg_spectrum: true,
             braille_stream: false,
             led_bars: false,

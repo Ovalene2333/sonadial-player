@@ -13,6 +13,7 @@ use eframe::egui::{
 };
 
 use crate::audio::AudioEngine;
+use crate::auto_theme::{self, Fade, Mood};
 use crate::beat_config::{BeatConfig, ShortVisual};
 use crate::design as tokens;
 use crate::download::{self, DownloadEvent};
@@ -20,11 +21,15 @@ use crate::eq::{self, BAND_FREQS, MAX_GAIN_DB, MIN_GAIN_DB, NUM_BANDS};
 use crate::lyrics::{self, LyricLine};
 use crate::notes::NoteAnalysis;
 use crate::pitch::NoteFrame;
+use crate::sound_profile::SoundProfile;
 use crate::spectrum::{SpectrumEngine, VisualState};
 use crate::storage::{self, PersistedState};
 use crate::theme::{self, *};
+use crate::theme_library::{format_hex, parse_hex, Hex, Overrides, ThemeLibrary, ThemeSpec, NAME_MAX};
 
 const TOP_H: f32 = 44.0;
+const THEME_KEY_W: f32 = 88.0;
+const THEME_TINT_MAX: f32 = 0.6;
 const BEAT_VISUAL_LEAD: f64 = 0.025;
 const TOP_LABEL_Y: f32 = 16.0;
 const SIDEBAR_W: f32 = 360.0;
@@ -81,6 +86,66 @@ enum SettingsPage {
     Theme,
 }
 
+/// Text buffers for the user theme being edited; committed values live in
+/// the theme library.
+struct ThemeEditor {
+    spec: usize,
+    name: String,
+    background: [String; 4],
+    accent: String,
+    delete_armed: bool,
+}
+
+impl ThemeEditor {
+    fn new(spec: usize, source: &ThemeSpec) -> Self {
+        let mut editor = Self {
+            spec,
+            name: String::new(),
+            background: Default::default(),
+            accent: String::new(),
+            delete_armed: false,
+        };
+        editor.sync(source);
+        editor
+    }
+
+    fn sync(&mut self, source: &ThemeSpec) {
+        self.name = source.name.trim().to_owned();
+        for (slot, text) in self.background.iter_mut().enumerate() {
+            *text = source
+                .background
+                .get(slot)
+                .map(|hex| format_hex(hex.0))
+                .unwrap_or_default();
+        }
+        self.accent = format_hex(source.accent.0);
+    }
+}
+
+enum ThemeEdit {
+    Rename(String),
+    Background(usize, Rgb),
+    BackgroundCount(usize),
+    Accent(Rgb),
+    Tint(f32),
+    Dark(Option<bool>),
+    ClearOverrides,
+}
+
+enum ThemeAction {
+    Select(usize),
+    /// Follow the track; `true` for dark.
+    Auto(bool),
+    /// Copy an entry into a new user theme and open it in the editor.
+    Copy(usize),
+    /// Same, for the AUTO look on screen.
+    CopyAuto,
+    Edit(usize),
+    Reload,
+    Back,
+    Delete(usize),
+}
+
 enum Action {
     Play(usize),
     AddFiles,
@@ -118,6 +183,7 @@ struct BeatAnalysisResult {
     generation: u64,
     path: PathBuf,
     beats: Vec<(f64, f32)>,
+    profile: Option<SoundProfile>,
 }
 
 struct NoteAnalysisHandle {
@@ -187,7 +253,18 @@ pub struct SonadialApp {
     sidebar_open: bool,
     show_settings: bool,
     settings_page: SettingsPage,
-    theme_index: usize,
+    themes: ThemeLibrary,
+    theme_name: String,
+    theme_editor: Option<ThemeEditor>,
+    themes_dirty: bool,
+    /// AUTO theme: `Some(dark)` while on; `theme_name` keeps the manual pick.
+    auto_dark: Option<bool>,
+    /// Mood the AUTO look is generated from; the last analysed track's while
+    /// the current one is still being analysed.
+    auto_mood: Option<Mood>,
+    /// Mood measured for the current track, once its analysis is in.
+    track_mood: Option<Mood>,
+    theme_fade: Option<Fade>,
     show_bg_spectrum: bool,
     braille_stream: bool,
     led_bars: bool,
@@ -225,11 +302,25 @@ impl SonadialApp {
     pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
         let state = storage::load();
         let beat_config = BeatConfig::load();
-        let theme_index = state
-            .theme
-            .unwrap_or(if state.light { 1 } else { 0 })
-            .min(theme::THEME_COUNT - 1);
-        theme::set_theme(theme_index);
+        let themes = ThemeLibrary::load();
+        let theme_error = themes
+            .load_error()
+            .map(|error| format!("THEMES.JSON / {error}"));
+        // Name first; the index is what builds before named themes stored.
+        let theme_entry = state
+            .theme_name
+            .as_deref()
+            .and_then(|name| themes.find(name))
+            .or_else(|| state.theme.and_then(|index| themes.find_builtin(index)))
+            .or_else(|| themes.find_builtin(if state.light { 1 } else { 0 }))
+            .unwrap_or(0);
+        let theme_name = themes.entries()[theme_entry].name.clone();
+        let auto_dark = state.auto_theme;
+        let auto_mood = state.auto_mood.map(Mood::sanitized);
+        theme::set_look(match auto_dark {
+            Some(dark) => auto_theme::look(auto_mood.unwrap_or_default(), dark),
+            None => themes.entries()[theme_entry].look,
+        });
         theme::install(&cc.egui_ctx);
 
         let lrc_map: HashMap<String, PathBuf> = state
@@ -339,7 +430,14 @@ impl SonadialApp {
             sidebar_open: true,
             show_settings: false,
             settings_page: SettingsPage::System,
-            theme_index,
+            themes,
+            theme_name,
+            theme_editor: None,
+            themes_dirty: false,
+            auto_dark,
+            auto_mood,
+            track_mood: None,
+            theme_fade: None,
             show_bg_spectrum: state.show_bg_spectrum,
             braille_stream: dot_style,
             led_bars: dot_style,
@@ -363,7 +461,7 @@ impl SonadialApp {
             download_progress: 0.0,
             download_status: String::new(),
             download_running: false,
-            error: None,
+            error: theme_error,
             seek_preview: None,
             play_mode: PlayMode::Sequence,
             last_tick: Instant::now(),
@@ -417,6 +515,7 @@ impl SonadialApp {
 
         self.poll_beat_analysis();
         self.poll_note_analysis();
+        self.step_theme_fade(ctx);
         self.engine.drain_analysis(&mut self.samples, 16_384);
         let active = self.playing && !self.paused;
         let offline_beat = if active {
@@ -677,12 +776,185 @@ impl SonadialApp {
         }
     }
 
+    /// A manual pick, which also leaves AUTO.
     fn select_theme(&mut self, index: usize, ctx: &Context) {
-        self.theme_index = index.min(theme::THEME_COUNT - 1);
-        theme::set_theme(self.theme_index);
+        let Some(entry) = self.themes.entry(index) else {
+            return;
+        };
+        self.theme_name = entry.name.clone();
+        self.auto_dark = None;
+        self.theme_fade = None;
+        theme::set_look(entry.look);
         theme::apply(ctx);
         ctx.request_repaint();
         self.dirty = true;
+    }
+
+    /// Re-applies the current theme after the library changed; falls back to
+    /// MONO or PAPER, matching the current brightness, when it is gone.
+    fn refresh_theme(&mut self, ctx: &Context) {
+        if self.auto_dark.is_some() {
+            // The AUTO look does not come from the library.
+            return;
+        }
+        let index = self
+            .themes
+            .find(&self.theme_name)
+            .or_else(|| {
+                self.themes
+                    .find_builtin(if theme::is_light() { 1 } else { 0 })
+            })
+            .unwrap_or(0);
+        self.select_theme(index, ctx);
+    }
+
+    /// What the AUTO look would be generated from right now. Turning AUTO on
+    /// switches straight to it; only track changes fade.
+    fn auto_preview_mood(&self) -> Mood {
+        match self.auto_dark {
+            Some(_) => self.auto_mood,
+            None => self.track_mood.or(self.auto_mood),
+        }
+        .unwrap_or_default()
+    }
+
+    fn select_auto(&mut self, dark: bool, ctx: &Context) {
+        let mood = self.auto_preview_mood();
+        self.auto_mood = Some(mood);
+        self.auto_dark = Some(dark);
+        self.theme_fade = None;
+        theme::set_look(auto_theme::look(mood, dark));
+        theme::apply(ctx);
+        ctx.request_repaint();
+        self.dirty = true;
+    }
+
+    /// Fades the AUTO look to a newly analysed track.
+    fn follow_track_mood(&mut self, mood: Mood) {
+        self.track_mood = Some(mood);
+        let Some(dark) = self.auto_dark else {
+            return;
+        };
+        self.auto_mood = Some(mood);
+        self.theme_fade = Some(Fade::new(
+            theme::current_look(),
+            auto_theme::look(mood, dark),
+        ));
+        self.dirty = true;
+    }
+
+    fn step_theme_fade(&mut self, ctx: &Context) {
+        let Some(fade) = self.theme_fade else {
+            return;
+        };
+        let (look, done) = fade.sample(Instant::now());
+        theme::set_look(look);
+        theme::apply(ctx);
+        if done {
+            self.theme_fade = None;
+        } else {
+            ctx.request_repaint();
+        }
+    }
+
+    fn open_theme_editor(&mut self, index: usize) {
+        let Some(spec) = self.themes.entry(index).and_then(|entry| entry.spec) else {
+            return;
+        };
+        if let Some(source) = self.themes.spec(spec) {
+            self.theme_editor = Some(ThemeEditor::new(spec, source));
+        }
+    }
+
+    fn sync_theme_editor(&mut self) {
+        if let Some(editor) = self.theme_editor.as_mut() {
+            match self.themes.spec(editor.spec) {
+                Some(source) => editor.sync(source),
+                None => self.theme_editor = None,
+            }
+        }
+    }
+
+    fn edit_theme(&mut self, edit: ThemeEdit, ctx: &Context) {
+        let Some(spec) = self.theme_editor.as_ref().map(|editor| editor.spec) else {
+            return;
+        };
+        if !self.themes.editable() {
+            return;
+        }
+        let index = self.themes.edit(spec, |target| match edit {
+            ThemeEdit::Rename(name) => target.name = name,
+            ThemeEdit::Background(slot, rgb) => {
+                if let Some(hex) = target.background.get_mut(slot) {
+                    *hex = Hex(rgb);
+                }
+            }
+            ThemeEdit::BackgroundCount(count) => target.set_background_count(count),
+            ThemeEdit::Accent(rgb) => target.accent = Hex(rgb),
+            ThemeEdit::Tint(tint) => target.tint = tint,
+            ThemeEdit::Dark(dark) => target.dark = dark,
+            ThemeEdit::ClearOverrides => target.colors = Overrides::default(),
+        });
+        self.themes_dirty = true;
+        match index {
+            Some(index) => self.select_theme(index, ctx),
+            None => self.refresh_theme(ctx),
+        }
+    }
+
+    fn theme_action(&mut self, action: ThemeAction, ctx: &Context) {
+        match action {
+            ThemeAction::Select(index) => self.select_theme(index, ctx),
+            ThemeAction::Auto(dark) => self.select_auto(dark, ctx),
+            ThemeAction::CopyAuto => {
+                let Some(dark) = self.auto_dark else {
+                    return;
+                };
+                if !self.themes.editable() {
+                    return;
+                }
+                // The target look, not a frame of a fade still running.
+                let mood = self.auto_preview_mood();
+                let look = auto_theme::look(mood, dark);
+                if let Some(copy) = self.themes.adopt(&mood.name(), &look) {
+                    self.themes_dirty = true;
+                    self.select_theme(copy, ctx);
+                    self.open_theme_editor(copy);
+                }
+            }
+            ThemeAction::Copy(index) => {
+                if !self.themes.editable() {
+                    return;
+                }
+                if let Some(copy) = self.themes.duplicate(index) {
+                    self.themes_dirty = true;
+                    self.select_theme(copy, ctx);
+                    self.open_theme_editor(copy);
+                }
+            }
+            ThemeAction::Edit(index) => self.open_theme_editor(index),
+            ThemeAction::Reload => {
+                // Pending UI edits are written first; if the file was changed
+                // by hand meanwhile, the save is refused and the disk wins.
+                if self.themes_dirty {
+                    let _ = self.themes.save();
+                    self.themes_dirty = false;
+                }
+                self.themes.reload();
+                if let Some(error) = self.themes.load_error() {
+                    self.error = Some(format!("THEMES.JSON / {error}"));
+                }
+                self.theme_editor = None;
+                self.refresh_theme(ctx);
+            }
+            ThemeAction::Back => self.theme_editor = None,
+            ThemeAction::Delete(spec) => {
+                self.themes.remove(spec);
+                self.themes_dirty = true;
+                self.theme_editor = None;
+                self.refresh_theme(ctx);
+            }
+        }
     }
 
     fn apply_eq(&mut self) {
@@ -853,6 +1125,7 @@ impl SonadialApp {
     fn start_beat_analysis(&mut self, path: &Path) {
         self.cancel_beat_analysis();
         self.clear_offline_beats();
+        self.track_mood = None;
         self.beat_generation = self.beat_generation.wrapping_add(1);
         let generation = self.beat_generation;
         let path = path.to_owned();
@@ -864,13 +1137,14 @@ impl SonadialApp {
         let spawned = std::thread::Builder::new()
             .name("sonadial-beat-analysis".to_owned())
             .spawn(move || {
-                let beats = crate::beat::analyze_file(&thread_path, &thread_cancel, &thread_config)
-                    .map(|analysis| analysis.beats)
-                    .unwrap_or_default();
+                let analysis =
+                    crate::beat::analyze_file(&thread_path, &thread_cancel, &thread_config)
+                        .unwrap_or_default();
                 let _ = tx.send(BeatAnalysisResult {
                     generation,
                     path: thread_path,
-                    beats,
+                    beats: analysis.beats,
+                    profile: analysis.profile,
                 });
             });
         if spawned.is_ok() {
@@ -921,6 +1195,9 @@ impl SonadialApp {
                 self.offline_index = self
                     .offline_beats
                     .partition_point(|(time, _)| *time < position - 0.025);
+                if let Some(profile) = result.profile {
+                    self.follow_track_mood(Mood::from_profile(&profile));
+                }
             }
         } else if disconnected {
             self.beat_analysis = None;
@@ -1738,7 +2015,14 @@ impl SonadialApp {
                 .map(|track| track.path.to_string_lossy().to_string()),
             volume: self.default_volume,
             light: theme::is_light(),
-            theme: Some(self.theme_index),
+            theme: self
+                .themes
+                .find(&self.theme_name)
+                .and_then(|index| self.themes.entry(index))
+                .and_then(|entry| entry.builtin),
+            theme_name: Some(self.theme_name.clone()),
+            auto_theme: self.auto_dark,
+            auto_mood: self.auto_mood,
             show_bg_spectrum: self.show_bg_spectrum,
             braille_stream: self.braille_stream,
             led_bars: self.led_bars,
@@ -1762,6 +2046,12 @@ impl SonadialApp {
             piano_mode: self.piano_mode,
         };
         storage::save(&state);
+        if self.themes_dirty {
+            self.themes_dirty = false;
+            if let Err(error) = self.themes.save() {
+                self.error = Some(error);
+            }
+        }
         self.dirty = false;
         self.save_at = Instant::now();
     }
@@ -2901,6 +3191,393 @@ impl SonadialApp {
         }
     }
 
+    fn auto_status(&self) -> String {
+        let Some(track) = self.track_mood else {
+            let state = match self.beat_analysis {
+                Some(_) => "ANALYSING TRACK",
+                None => "NO TRACK ANALYSED",
+            };
+            return format!("{state} / KEEPING THE LAST LOOK");
+        };
+        let percent = |value: f32| (value * 100.0).round() as i32;
+        format!(
+            "TRACK: {} / TONE {:+}% / DRIVE {:+}% / PULSE {:+}% / CLARITY {:+}%",
+            track.kind.label(),
+            percent(track.tone),
+            percent(track.drive),
+            percent(track.pulse),
+            percent(track.clarity)
+        )
+    }
+
+    fn theme_page(&mut self, ui: &mut Ui, ctx: &Context) {
+        if self.theme_editor.is_some() {
+            self.theme_editor_page(ui, ctx);
+            return;
+        }
+        let auto = self.auto_dark;
+        let auto_mood = self.auto_preview_mood();
+        let current = match auto {
+            Some(_) => None,
+            None => self.themes.find(&self.theme_name),
+        };
+        let current_entry = current.and_then(|index| self.themes.entry(index));
+        let category = current_entry.map_or("-", |entry| entry.category.label());
+        let current_custom = current_entry.is_some_and(|entry| entry.spec.is_some());
+        let editable = self.themes.editable();
+        let mut action = None;
+
+        ui.label(
+            RichText::new("THEME")
+                .font(mono(24.0))
+                .color(theme::text_hi()),
+        );
+        ui.add_space(tokens::SPACE_1);
+        let current_line = match auto {
+            Some(dark) => format!(
+                "CURRENT: AUTO {} / {}",
+                if dark { "DARK" } else { "LIGHT" },
+                auto_mood.kind.label()
+            ),
+            None => format!("CURRENT: {} / {category}", self.theme_name),
+        };
+        ui.label(
+            RichText::new(current_line)
+                .font(mono(12.0))
+                .color(theme::text_dim()),
+        );
+        if auto.is_some() {
+            ui.label(
+                RichText::new(self.auto_status())
+                    .font(mono(12.0))
+                    .color(theme::text_dim()),
+            );
+        }
+        ui.add_space(tokens::SPACE_2);
+        ui.horizontal(|ui| {
+            if editable {
+                match current {
+                    None if auto.is_some() => {
+                        if tui_button(ui, "[ CUSTOMIZE ]", 120.0).clicked() {
+                            action = Some(ThemeAction::CopyAuto);
+                        }
+                    }
+                    Some(index) if current_custom => {
+                        if tui_button(ui, "[ EDIT ]", 96.0).clicked() {
+                            action = Some(ThemeAction::Edit(index));
+                        }
+                    }
+                    Some(index) => {
+                        if tui_button(ui, "[ CUSTOMIZE ]", 120.0).clicked() {
+                            action = Some(ThemeAction::Copy(index));
+                        }
+                    }
+                    None => {}
+                }
+            }
+            if tui_button(ui, "[ RELOAD ]", 96.0).clicked() {
+                action = Some(ThemeAction::Reload);
+            }
+        });
+        if let Some(error) = self.themes.load_error() {
+            ui.label(
+                RichText::new(format!("THEMES.JSON ERROR / {error}"))
+                    .font(mono(12.0))
+                    .color(theme::danger()),
+            );
+            ui.label(
+                RichText::new("FIX THE FILE, THEN RELOAD")
+                    .font(mono(12.0))
+                    .color(theme::text_dim()),
+            );
+        }
+        let warnings = self.themes.warnings();
+        if let Some(first) = warnings.first() {
+            let more = match warnings.len() {
+                1 => String::new(),
+                count => format!(" (+{} MORE)", count - 1),
+            };
+            ui.label(
+                RichText::new(format!("SKIPPED {first}{more}"))
+                    .font(mono(12.0))
+                    .color(theme::danger()),
+            );
+        }
+        ui.add_space(tokens::SPACE_3);
+
+        let gap = ui.spacing().item_spacing.x;
+        let chip_w = ((ui.available_width() - gap * 3.0) / 4.0).max(80.0);
+
+        ui.label(
+            RichText::new("AUTO")
+                .font(mono(12.0))
+                .color(theme::text_dim()),
+        );
+        ui.add_space(tokens::SPACE_1);
+        ui.horizontal(|ui| {
+            for (label, dark) in [("AUTO DARK", true), ("AUTO LIGHT", false)] {
+                let look = auto_theme::look(auto_mood, dark);
+                if theme_chip(ui, label, chip_w, &look, auto == Some(dark)).clicked() {
+                    action = Some(ThemeAction::Auto(dark));
+                }
+            }
+        });
+        if auto.is_none() {
+            ui.label(
+                RichText::new("GRADIENT BY SONG TYPE, READ FROM THE TRACK'S SOUND")
+                    .font(mono(12.0))
+                    .color(theme::text_dim()),
+            );
+        }
+        ui.add_space(tokens::SPACE_3);
+
+        let entries = self.themes.entries();
+        for category in Category::ALL {
+            let members: Vec<usize> = (0..entries.len())
+                .filter(|&index| entries[index].category == category)
+                .collect();
+            if members.is_empty() && category != Category::Custom {
+                continue;
+            }
+            ui.label(
+                RichText::new(category.label())
+                    .font(mono(12.0))
+                    .color(theme::text_dim()),
+            );
+            ui.add_space(tokens::SPACE_1);
+            // Dark and light variants get their own rows unless one row holds all.
+            let (dark, light): (Vec<usize>, Vec<usize>) = members
+                .iter()
+                .partition(|&&index| entries[index].look.palette.dark);
+            let rows: Vec<&[usize]> = if members.len() <= 4 {
+                vec![&members[..]]
+            } else {
+                dark.chunks(4).chain(light.chunks(4)).collect()
+            };
+            for row in rows.into_iter().filter(|row| !row.is_empty()) {
+                ui.horizontal(|ui| {
+                    for &index in row {
+                        let entry = &entries[index];
+                        if theme_chip(ui, &entry.name, chip_w, &entry.look, current == Some(index))
+                            .clicked()
+                        {
+                            action = Some(ThemeAction::Select(index));
+                        }
+                    }
+                });
+            }
+            if category == Category::Custom {
+                if members.is_empty() {
+                    ui.label(
+                        RichText::new("NONE YET / CUSTOMIZE COPIES THE CURRENT THEME")
+                            .font(mono(12.0))
+                            .color(theme::text_dim()),
+                    );
+                }
+                ui.add_space(tokens::SPACE_1);
+                path_row(ui, "FILE", &ThemeLibrary::path());
+            } else {
+                ui.add_space(tokens::SPACE_3);
+            }
+        }
+
+        if let Some(action) = action {
+            self.theme_action(action, ctx);
+        }
+    }
+
+    fn theme_editor_page(&mut self, ui: &mut Ui, ctx: &Context) {
+        let Some(mut editor) = self.theme_editor.take() else {
+            return;
+        };
+        let Some(spec) = self.themes.spec(editor.spec).cloned() else {
+            return;
+        };
+        let entry = self
+            .themes
+            .entries()
+            .iter()
+            .position(|entry| entry.spec == Some(editor.spec));
+        let resolved_dark = entry
+            .and_then(|index| self.themes.entry(index))
+            .map(|entry| entry.look.palette.dark);
+        let mut edits = Vec::new();
+        let mut action = None;
+
+        ui.horizontal(|ui| {
+            if tui_button(ui, "[ < BACK ]", 96.0).clicked() {
+                action = Some(ThemeAction::Back);
+            }
+            ui.add_space(tokens::SPACE_2);
+            ui.label(
+                RichText::new("CUSTOM THEME / CHANGES APPLY LIVE")
+                    .font(mono(12.0))
+                    .color(theme::text_dim()),
+            );
+        });
+        ui.add_space(tokens::SPACE_3);
+
+        ui.horizontal(|ui| {
+            theme_key(ui, "NAME");
+            let response = text_field(ui, &mut editor.name, 150.0, NAME_MAX);
+            let name = editor.name.trim().to_owned();
+            let changed = name != spec.name.trim();
+            let free = self.themes.name_free(&name, Some(editor.spec));
+            if response.lost_focus() {
+                if changed && free {
+                    edits.push(ThemeEdit::Rename(name.clone()));
+                    editor.name = name;
+                } else {
+                    editor.name = spec.name.trim().to_owned();
+                }
+            } else if changed && !free {
+                ui.add_space(tokens::SPACE_2);
+                ui.label(
+                    RichText::new(if name.is_empty() { "EMPTY" } else { "IN USE" })
+                        .font(mono(12.0))
+                        .color(theme::danger()),
+                );
+            }
+        });
+
+        let count = spec.background.len();
+        ui.horizontal(|ui| {
+            theme_key(ui, "BACKGROUND");
+            for (option, label) in [(1, "SOLID"), (2, "2-COLOR"), (4, "4-CORNER")] {
+                if tui_button(ui, &toggle_label(label, count == option), 96.0).clicked()
+                    && count != option
+                {
+                    edits.push(ThemeEdit::BackgroundCount(option));
+                }
+            }
+        });
+        // Fields sit where their colour lands on screen; BLEND runs from the
+        // top-left to the bottom-right corner.
+        let rows: &[(&str, &[usize])] = match count {
+            1 => &[("COLOR", &[0])],
+            2 => &[("BLEND", &[0, 1])],
+            _ => &[("TOP", &[0, 1]), ("BOTTOM", &[3, 2])],
+        };
+        for &(key, slots) in rows {
+            ui.horizontal(|ui| {
+                theme_key(ui, key);
+                for (position, &slot) in slots.iter().enumerate() {
+                    let Some(&Hex(current)) = spec.background.get(slot) else {
+                        continue;
+                    };
+                    if position > 0 {
+                        ui.add_space(tokens::SPACE_3);
+                    }
+                    if let Some(rgb) = hex_field(ui, &mut editor.background[slot], current) {
+                        edits.push(ThemeEdit::Background(slot, rgb));
+                    }
+                }
+            });
+        }
+
+        ui.horizontal(|ui| {
+            theme_key(ui, "ACCENT");
+            if let Some(rgb) = hex_field(ui, &mut editor.accent, spec.accent.0) {
+                edits.push(ThemeEdit::Accent(rgb));
+            }
+            ui.add_space(tokens::SPACE_3);
+            ui.label(
+                RichText::new("TINTS SPECTRUM + TEXT")
+                    .font(mono(12.0))
+                    .color(theme::text_dim()),
+            );
+        });
+
+        let tint = spec.tint();
+        ui.horizontal(|ui| {
+            theme_key(ui, "TINT");
+            if tui_button(ui, "[-]", 34.0).clicked() {
+                edits.push(ThemeEdit::Tint(step_tint(tint, -1.0)));
+            }
+            ui.label(
+                RichText::new(format!("{:>3}%", (tint * 100.0).round() as i32))
+                    .font(mono(12.0))
+                    .color(theme::text()),
+            );
+            if tui_button(ui, "[+]", 34.0).clicked() {
+                edits.push(ThemeEdit::Tint(step_tint(tint, 1.0)));
+            }
+            ui.add_space(tokens::SPACE_3);
+            ui.label(
+                RichText::new("ACCENT SHARE IN SPECTRUM")
+                    .font(mono(12.0))
+                    .color(theme::text_dim()),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            theme_key(ui, "MODE");
+            for (option, label) in [(None, "AUTO"), (Some(true), "DARK"), (Some(false), "LIGHT")] {
+                if tui_button(ui, &toggle_label(label, spec.dark == option), 80.0).clicked()
+                    && spec.dark != option
+                {
+                    edits.push(ThemeEdit::Dark(option));
+                }
+            }
+            if let (None, Some(dark)) = (spec.dark, resolved_dark) {
+                ui.label(
+                    RichText::new(if dark { "= DARK" } else { "= LIGHT" })
+                        .font(mono(12.0))
+                        .color(theme::text_dim()),
+                );
+            }
+        });
+
+        let overrides = spec.colors.count();
+        if overrides > 0 {
+            ui.horizontal(|ui| {
+                theme_key(ui, "OVERRIDES");
+                ui.label(
+                    RichText::new(format!("{overrides} SET IN JSON"))
+                        .font(mono(12.0))
+                        .color(theme::text()),
+                );
+                ui.add_space(tokens::SPACE_2);
+                if tui_button(ui, "[ CLEAR ]", 80.0).clicked() {
+                    edits.push(ThemeEdit::ClearOverrides);
+                }
+            });
+        }
+
+        ui.add_space(tokens::SPACE_3);
+        ui.horizontal(|ui| {
+            if let Some(index) = entry {
+                if tui_button(ui, "[ DUPLICATE ]", 112.0).clicked() {
+                    action = Some(ThemeAction::Copy(index));
+                }
+            }
+            if editor.delete_armed {
+                if tui_button_ink(ui, "[ CONFIRM DELETE ]", 150.0, theme::danger()).clicked() {
+                    action = Some(ThemeAction::Delete(editor.spec));
+                }
+                if tui_button(ui, "[ KEEP ]", 80.0).clicked() {
+                    editor.delete_armed = false;
+                }
+            } else if tui_button_ink(ui, "[ DELETE ]", 96.0, theme::danger()).clicked() {
+                editor.delete_armed = true;
+            }
+        });
+
+        self.theme_editor = Some(editor);
+        let resync = edits
+            .iter()
+            .any(|edit| matches!(edit, ThemeEdit::BackgroundCount(_) | ThemeEdit::ClearOverrides));
+        for edit in edits {
+            self.edit_theme(edit, ctx);
+        }
+        if resync {
+            self.sync_theme_editor();
+        }
+        if let Some(action) = action {
+            self.theme_action(action, ctx);
+        }
+    }
+
     fn overlays(&mut self, ctx: &Context) -> Vec<Action> {
         let mut actions = Vec::new();
 
@@ -2966,43 +3643,7 @@ impl SonadialApp {
                                     ui.add_space(tokens::SPACE_3);
                                     info_row(ui, "OUTPUT", &self.output_label);
                                     ui.add_space(tokens::HAIRLINE);
-                                    ui.horizontal(|ui| {
-                                        ui.add_sized(
-                                            [120.0, tokens::LINE_H],
-                                            egui::Label::new(
-                                                RichText::new("STATE")
-                                                    .font(mono(12.0))
-                                                    .color(theme::text_dim()),
-                                            ),
-                                        );
-                                        let font = ui_font(12.0);
-                                        let path = storage::state_path().display().to_string();
-                                        let text = elide_to_width(
-                                            ui.painter(),
-                                            &path,
-                                            font.clone(),
-                                            (ui.available_width() - 4.0).max(80.0),
-                                        );
-                                        let response = ui
-                                            .add(
-                                                egui::Label::new(
-                                                    RichText::new(text)
-                                                        .font(font)
-                                                        .color(theme::text_hi())
-                                                        .underline(),
-                                                )
-                                                .sense(Sense::click()),
-                                            )
-                                            .on_hover_text(path);
-                                        if response.hovered() {
-                                            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
-                                        }
-                                        if response.clicked() {
-                                            let _ = std::process::Command::new("explorer")
-                                                .arg(storage::data_dir())
-                                                .spawn();
-                                        }
-                                    });
+                                    path_row(ui, "STATE", &storage::state_path());
                                     ui.add_space(tokens::SPACE_3);
                                     ui.label(
                                         RichText::new("SHORTCUTS")
@@ -3228,50 +3869,14 @@ impl SonadialApp {
                                         }
                                     });
                                 }
-                                SettingsPage::Theme => {
-                                    ui.label(
-                                        RichText::new("THEME")
-                                            .font(mono(24.0))
-                                            .color(theme::text_hi()),
-                                    );
-                                    ui.add_space(tokens::SPACE_1);
-                                    ui.label(
-                                        RichText::new(format!("CURRENT: {}", theme::theme_name()))
-                                            .font(mono(12.0))
-                                            .color(theme::text_dim()),
-                                    );
-                                    ui.add_space(tokens::SPACE_3);
-                                    let gap = ui.spacing().item_spacing.x;
-                                    let chip_w =
-                                        ((ui.available_width() - gap * 2.0) / 3.0).max(96.0);
-                                    for row in 0..(theme::THEME_COUNT + 2) / 3 {
-                                        ui.horizontal(|ui| {
-                                            for col in 0..3 {
-                                                let index = row * 3 + col;
-                                                if index >= theme::THEME_COUNT {
-                                                    break;
-                                                }
-                                                let name = theme::THEME_NAMES[index];
-                                                if theme_chip(
-                                                    ui,
-                                                    name,
-                                                    chip_w,
-                                                    index,
-                                                    self.theme_index == index,
-                                                )
-                                                .clicked()
-                                                {
-                                                    self.select_theme(index, ctx);
-                                                }
-                                            }
-                                        });
-                                    }
-                                }
+                                SettingsPage::Theme => self.theme_page(ui, ctx),
                             }
                         });
                 });
             if !open {
                 self.show_settings = false;
+                // Drop half-typed text so reopening shows the saved values.
+                self.sync_theme_editor();
             }
         }
 
@@ -4278,12 +4883,13 @@ fn tab_button(ui: &mut Ui, label: &str, width: f32, active: bool) -> Response {
     response
 }
 
-fn theme_chip(ui: &mut Ui, label: &str, width: f32, index: usize, active: bool) -> Response {
+fn theme_chip(ui: &mut Ui, label: &str, width: f32, look: &Look, active: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, tokens::CHIP_H), Sense::click());
-    let (_, fg, dim) = theme::theme_colors(index);
+    let (fg, dim) = (look.text_hi(), look.text_dim());
     let hovered = response.hovered();
     let painter = ui.painter();
-    theme::paint_theme_preview(painter, rect, index);
+    theme::paint_look(painter, rect, look);
+    let label = elide_to_width(painter, label, mono(12.0), width - tokens::SPACE_2 * 2.0);
     let border = if active {
         Stroke::new(2.0, fg)
     } else if hovered {
@@ -4314,6 +4920,10 @@ fn theme_chip(ui: &mut Ui, label: &str, width: f32, index: usize, active: bool) 
 }
 
 fn tui_button(ui: &mut Ui, label: &str, width: f32) -> Response {
+    tui_button_ink(ui, label, width, theme::text())
+}
+
+fn tui_button_ink(ui: &mut Ui, label: &str, width: f32, ink: Color32) -> Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(width, tokens::CONTROL_H), Sense::click());
     let hovered = response.hovered();
@@ -4326,12 +4936,109 @@ fn tui_button(ui: &mut Ui, label: &str, width: f32) -> Response {
         Align2::CENTER_CENTER,
         label,
         mono(12.0),
-        if hovered { theme::bg() } else { theme::text() },
+        if hovered { theme::bg() } else { ink },
     );
     if hovered {
         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     }
     response
+}
+
+fn theme_key(ui: &mut Ui, key: &str) {
+    let (rect, _) =
+        ui.allocate_exact_size(Vec2::new(THEME_KEY_W, tokens::CONTROL_H), Sense::hover());
+    ui.painter().text(
+        Pos2::new(rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        key,
+        mono(12.0),
+        theme::text_dim(),
+    );
+}
+
+fn text_field(ui: &mut Ui, text: &mut String, width: f32, limit: usize) -> Response {
+    Frame::NONE
+        .stroke(Stroke::new(1.0, theme::line()))
+        .inner_margin(egui::Margin::symmetric(tokens::SPACE_1 as i8, 0))
+        .show(ui, |ui| {
+            ui.visuals_mut().selection.bg_fill = theme::alpha(theme::text_hi(), 64);
+            ui.add_sized(
+                [width, tokens::FIELD_H],
+                TextEdit::singleline(text)
+                    .font(mono(12.0))
+                    .text_color(theme::text_hi())
+                    .char_limit(limit)
+                    .align(Align2::LEFT_CENTER)
+                    .frame(Frame::NONE),
+            )
+        })
+        .inner
+}
+
+/// Swatch plus `#RRGGBB` input. Returns the colour once the text turns into a
+/// new valid value; on blur the text snaps back to the stored colour.
+fn hex_field(ui: &mut Ui, text: &mut String, current: Rgb) -> Option<Rgb> {
+    let (swatch, _) = ui.allocate_exact_size(Vec2::splat(tokens::CONTROL_H), Sense::hover());
+    ui.painter().rect_filled(
+        swatch,
+        tokens::RADIUS,
+        Color32::from_rgb(current[0], current[1], current[2]),
+    );
+    ui.painter().rect_stroke(
+        swatch,
+        tokens::RADIUS,
+        Stroke::new(1.0, theme::line()),
+        StrokeKind::Inside,
+    );
+    let response = text_field(ui, text, 64.0, 7);
+    let parsed = parse_hex(text);
+    if response.lost_focus() {
+        *text = format_hex(parsed.unwrap_or(current));
+    }
+    parsed.filter(|rgb| response.changed() && *rgb != current)
+}
+
+fn step_tint(tint: f32, direction: f32) -> f32 {
+    // 2 % steps; a hand-set value above the UI range is never pushed down by [+].
+    let next = ((tint + 0.02 * direction) * 50.0).round() / 50.0;
+    next.clamp(0.0, THEME_TINT_MAX.max(tint))
+}
+
+/// Clickable path that opens its folder in Explorer.
+fn path_row(ui: &mut Ui, key: &str, path: &Path) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [120.0, tokens::LINE_H],
+            egui::Label::new(RichText::new(key).font(mono(12.0)).color(theme::text_dim())),
+        );
+        let font = ui_font(12.0);
+        let shown = path.display().to_string();
+        let text = elide_to_width(
+            ui.painter(),
+            &shown,
+            font.clone(),
+            (ui.available_width() - 4.0).max(80.0),
+        );
+        let response = ui
+            .add(
+                egui::Label::new(
+                    RichText::new(text)
+                        .font(font)
+                        .color(theme::text_hi())
+                        .underline(),
+                )
+                .sense(Sense::click()),
+            )
+            .on_hover_text(shown);
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if response.clicked() {
+            if let Some(dir) = path.parent() {
+                let _ = std::process::Command::new("explorer").arg(dir).spawn();
+            }
+        }
+    });
 }
 
 fn tui_menu_header(ui: &mut Ui, title: &str) {
