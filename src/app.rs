@@ -5115,26 +5115,77 @@ fn path_row(ui: &mut Ui, key: &str, path: &Path) {
     });
 }
 
+/// Left inset shared by the menu header and item labels so the song title
+/// lines up with the commands below it.
+const MENU_TEXT_INSET: f32 = 9.0;
+
+#[derive(Clone, Default)]
+struct MenuHeaderMarquee {
+    title: String,
+    start: f64,
+    last: f64,
+}
+
 fn tui_menu_header(ui: &mut Ui, title: &str) {
     let width = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(
         Vec2::new(width, tokens::MENU_ITEM_H + tokens::SPACE_1),
         Sense::hover(),
     );
+    let text_rect = Rect::from_min_max(
+        Pos2::new(rect.left() + MENU_TEXT_INSET, rect.top()),
+        Pos2::new(rect.right() - MENU_TEXT_INSET, rect.bottom()),
+    );
+    let painter = ui.painter().with_clip_rect(text_rect);
+    // The two leading spaces match the offset of the item labels.
+    let label = format!("  {title}");
+    let font = mono(12.0);
+    let text_w = painter
+        .layout_no_wrap(label.clone(), font.clone(), Color32::WHITE)
+        .size()
+        .x;
+    let baseline = Pos2::new(text_rect.left(), rect.center().y);
+
+    if text_w <= text_rect.width() {
+        painter.text(baseline, Align2::LEFT_CENTER, label, font, theme::text_hi());
+    } else {
+        // Long titles scroll like a marquee instead of being cut off.
+        const PAUSE: f64 = 1.0;
+        const SPEED: f32 = 26.0;
+        const GAP: f32 = 40.0;
+        let now = ui.ctx().input(|input| input.time);
+        let start = ui.ctx().data_mut(|data| {
+            let state = data.get_temp_mut_or_default::<MenuHeaderMarquee>(Id::new(
+                "tui-menu-header-marquee",
+            ));
+            // Opening the menu again (or switching songs) restarts the scroll.
+            if state.title != title || now - state.last > 0.25 {
+                state.title = title.to_owned();
+                state.start = now;
+            }
+            state.last = now;
+            state.start
+        });
+        let travel = text_w + GAP;
+        let elapsed = (now - start).max(0.0);
+        let offset = if elapsed < PAUSE {
+            0.0
+        } else {
+            ((elapsed - PAUSE) as f32 * SPEED) % travel
+        };
+        // Draw a second copy one period ahead so the wrap is seamless.
+        for shift in [0.0, travel] {
+            painter.text(
+                Pos2::new(baseline.x - offset + shift, baseline.y),
+                Align2::LEFT_CENTER,
+                label.clone(),
+                font.clone(),
+                theme::text_hi(),
+            );
+        }
+        ui.ctx().request_repaint();
+    }
     let painter = ui.painter();
-    let title = elide_to_width(
-        painter,
-        title,
-        mono(12.0),
-        (width - tokens::GUTTER * 2.0).max(20.0),
-    );
-    painter.text(
-        Pos2::new(rect.left() + 10.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        title,
-        mono(12.0),
-        theme::text_hi(),
-    );
     painter.line_segment(
         [
             Pos2::new(rect.left() + 1.0, rect.bottom() - 0.5),
@@ -5155,7 +5206,7 @@ fn tui_menu_item(ui: &mut Ui, label: &str, danger: bool) -> Response {
         painter.rect_filled(rect, tokens::RADIUS, theme::text_hi());
     }
     painter.text(
-        Pos2::new(rect.left() + 9.0, rect.center().y),
+        Pos2::new(rect.left() + MENU_TEXT_INSET, rect.center().y),
         Align2::LEFT_CENTER,
         if hovered {
             format!("> {label}")
