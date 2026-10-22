@@ -344,13 +344,14 @@ struct SpectrumGrid {
     signal_rows: usize,
 }
 
-/// One background cell, quantised to an even number of device pixels. Keeping
-/// the cell even means each half-cell is an exact device pixel, so the dot
-/// lattice and the grid lines land on the same boundaries at any DPI.
+/// One background cell, quantised to a multiple of four device pixels. Two
+/// pixels make one dot cell, so a multiple of four keeps the dot centres, the
+/// half-step phase and the grid lines all on exact device pixels at any DPI.
 fn cell_dev(ppp: f32) -> usize {
-    let mut cell = (LED_CELL * ppp.max(1.0)).round().max(2.0) as usize;
-    if cell % DOTS_PER_CELL != 0 {
-        cell += 1;
+    let mut cell = (LED_CELL * ppp.max(1.0)).round().max(4.0) as usize;
+    let rem = cell % (DOTS_PER_CELL * 2);
+    if rem != 0 {
+        cell += DOTS_PER_CELL * 2 - rem;
     }
     cell
 }
@@ -373,9 +374,32 @@ fn pixel_grid(rect: Rect, ppp: f32) -> Option<SpectrumGrid> {
     let cell = cell_px as f32 / ppp;
     let panel_w = cols as f32 * cell;
     let panel_h = rows as f32 * cell;
-    let panel_left =
-        ((rect.left() + side_margin + (max_w - panel_w) * 0.5) * ppp).round() / ppp;
-    let panel_bottom = ((rect.bottom() - bottom_margin) * ppp).round() / ppp;
+    let mut left_dev =
+        ((rect.left() + side_margin + (max_w - panel_w) * 0.5) * ppp).round() as i32;
+    let mut bottom_dev = ((rect.bottom() - bottom_margin) * ppp).round() as i32;
+    // Shift the whole lattice by at most half a dot cell so the stage centre
+    // becomes a symmetry point. Then the core disc has the same number of dot
+    // rows above and below it (and columns left and right) while still sharing
+    // the background grid.
+    let symmetry = (cell_px / 4).max(1) as i32;
+    let center_x = (rect.center().x * ppp).round() as i32;
+    let center_y = (rect.center().y * ppp).round() as i32;
+    let rem_x = (center_x - left_dev).rem_euclid(symmetry);
+    let dx = if rem_x <= symmetry / 2 {
+        rem_x
+    } else {
+        rem_x - symmetry
+    };
+    left_dev += dx;
+    let rem_y = (center_y - bottom_dev).rem_euclid(symmetry);
+    let dy = if rem_y <= symmetry / 2 {
+        rem_y
+    } else {
+        rem_y - symmetry
+    };
+    bottom_dev += dy;
+    let panel_left = left_dev as f32 / ppp;
+    let panel_bottom = bottom_dev as f32 / ppp;
     let signal_rows = (((panel_h * 0.40) / cell).round() as usize).clamp(1, rows);
     Some(SpectrumGrid {
         rect: Rect::from_min_max(
@@ -626,12 +650,28 @@ pub fn paint_core(
         // beats also send a dotted ring outwards.
         let kick = if pulse_enabled { visual.kick } else { 0.0 };
         let ppp = painter.ctx().pixels_per_point().max(1.0);
-        let (step, dot) = dot_metrics_for_rect(rect, ppp);
+        let (step, dot, origin) = match pixel_grid(rect, ppp) {
+            Some(grid) => {
+                let (step, dot) = dot_metrics(&grid, ppp);
+                // The background dots sit at half-step offsets from the grid
+                // corner; use the same phase so the core lands on that lattice.
+                let origin = Pos2::new(
+                    grid.rect.left() + step * 0.5,
+                    grid.rect.bottom() - step * 0.5,
+                );
+                (step, dot, origin)
+            }
+            None => {
+                let (step, dot) = dot_metrics_for_rect(rect, ppp);
+                (step, dot, center)
+            }
+        };
         let age = if pulse_enabled { beat_age } else { 1.0 };
         let strength = if pulse_enabled { ring_strength } else { 0.0 };
         paint_core_dots(
             painter,
             center,
+            origin,
             base_disc_r,
             playing,
             kick,
@@ -961,13 +1001,14 @@ fn conical_color(t: f32, ring: Color32, hi: Color32, deep: Color32, main_a: u8) 
     stops[0].1
 }
 
-/// Draw the core as individual square dots on a pixel-snapped lattice. Font
-/// glyphs are not used here: rasterizing hundreds of tiny glyphs at fractional
-/// positions produces alternating gaps and a visible moiré across the disc.
-/// Direct dots keep the same matrix look with an exact uniform pitch.
+/// Draw the core as individual square dots on the shared background lattice.
+/// Font glyphs are not used here: rasterizing hundreds of tiny glyphs at
+/// fractional positions produces alternating gaps and a visible moiré across
+/// the disc. Direct dots keep the same matrix look with an exact uniform pitch.
 fn paint_core_dots(
     painter: &Painter,
     center: Pos2,
+    origin: Pos2,
     disc_r: f32,
     playing: bool,
     kick: f32,
@@ -981,6 +1022,7 @@ fn paint_core_dots(
     let ppp = painter.ctx().pixels_per_point().max(1.0);
     let snap = |value: f32| (value * ppp).round() / ppp;
     let center = Pos2::new(snap(center.x), snap(center.y));
+    let origin = Pos2::new(snap(origin.x), snap(origin.y));
 
     let t = (beat_age / PULSE_LIFE).clamp(0.0, 1.0);
     let ease = 1.0 - (1.0 - t).powi(2);
@@ -1000,11 +1042,13 @@ fn paint_core_dots(
 
     let reach = (disc_r + step * 2.0).max(ring_r + ring_half) + step;
     let n = (reach / step).ceil() as i32 + 1;
+    let base_i = ((center.x - origin.x) / step).floor() as i32;
+    let base_j = ((origin.y - center.y) / step).floor() as i32;
     let square = Vec2::splat(dot);
     for iy in -n..=n {
+        let y = origin.y - (base_j + iy) as f32 * step;
         for ix in -n..=n {
-            let x = center.x + ix as f32 * step;
-            let y = center.y + iy as f32 * step;
+            let x = origin.x + (base_i + ix) as f32 * step;
             let dist = ((x - center.x).powi(2) + (y - center.y).powi(2)).sqrt();
             let in_circle = dist <= disc_r;
             let in_ring = ring_on && (dist - ring_r).abs() <= ring_half;
