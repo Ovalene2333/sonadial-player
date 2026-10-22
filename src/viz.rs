@@ -13,15 +13,17 @@ const TAU: f32 = std::f32::consts::TAU;
 
 // One LED cell matches the 12 px TUI body text size.
 const LED_CELL: f32 = 12.0;
-// DOT MATRIX layout: one cell is two dot columns wide and four dot rows tall.
-// The actual dots are drawn as pixel-snapped squares, so the cell ratio only
-// drives the frequency-column layout; the faint backdrop lattice stays square
-// like the default style.
-const DOT_CELL_H: f32 = 18.0;
-const DOT_CELL_W: f32 = 9.0;
+// One background cell contains exactly 2x2 dot-matrix pixels. Both background
+// styles share this lattice, so the grid lines always fall between dots.
+const DOTS_PER_CELL: usize = 2;
 
 // Monochrome luminance ramp. The old ember ramp is gone; only brightness remains.
 const SPECTRUM_GREYS: [(f32, u8); 4] = [(0.00, 52), (0.22, 104), (0.52, 178), (0.85, 246)];
+
+// A peak marker only earns its own pixel when it is clearly above the bar.
+// The test uses raw dB values: once a bar saturates the 90 dB ceiling, both
+// values clamp to the same normalised height and the hold would disappear.
+const PEAK_MARKER_GAP_DB: f32 = 1.0;
 
 pub fn spectrum_color(norm: f32) -> Color32 {
     let value = norm.clamp(0.0, 1.0);
@@ -52,6 +54,7 @@ pub fn paint_spectrum(
     rotation: f32,
     size_scale: f32,
     led_bars: bool,
+    dot_bars: bool,
 ) {
     let usable = (rect.width().min(rect.height()) * 0.5 - 8.0).max(1.0);
     let scale = (usable / 258.0).clamp(0.45, 2.4) * size_scale.clamp(0.7, 1.2);
@@ -82,14 +85,22 @@ pub fn paint_spectrum(
         48,
     );
 
-    if !bars.iter().any(|bar| *bar > 0.01) {
+    if !bars.iter().any(|bar| *bar > 0.01)
+        && !(show_peaks && peaks.iter().any(|peak| *peak > 0.01))
+    {
         return;
     }
 
     if led_bars {
-        paint_radial_led(
-            painter, center, inner_r, max_amp, bars, peaks, show_peaks, rotation, scale,
-        );
+        if dot_bars {
+            paint_radial_dots(
+                painter, rect, center, inner_r, max_amp, bars, peaks, show_peaks, rotation,
+            );
+        } else {
+            paint_radial_led(
+                painter, center, inner_r, max_amp, bars, peaks, show_peaks, rotation, scale,
+            );
+        }
         return;
     }
 
@@ -121,16 +132,6 @@ pub fn paint_spectrum(
             color.b(),
             8,
         ));
-
-        if show_peaks {
-            let peak = peaks.get(i).copied().unwrap_or(0.0);
-            let peak_norm = (peak / MAX_DB_VALUE).clamp(0.0, 1.0);
-            if peak_norm > norm + 0.012 {
-                let point = center + dir * (inner_r + peak_norm * max_amp);
-                let peak_color = spectrum_color(peak_norm);
-                painter.circle_filled(point, (bar_w * 0.9).max(1.0), theme::alpha(peak_color, 190));
-            }
-        }
     }
 
     // Very wide, very faint halo.
@@ -152,6 +153,33 @@ pub fn paint_spectrum(
         painter.line_segment([p1[i], p2[i]], Stroke::new(bar_w, colors[i]));
         painter.circle_filled(p1[i], bar_w * 0.5, colors[i]);
         painter.circle_filled(p2[i], bar_w * 0.5, colors[i]);
+    }
+
+    // Peak markers go on top of every bar layer. Drawing them earlier let the
+    // bar tip cover the lower half of the dot, which looked like the peak had
+    // been shaved off whenever the two were close together.
+    if show_peaks {
+        let dot_r = (bar_w * 0.9).max(1.0);
+        for i in 0..NUM_BARS {
+            let height = bars.get(i).copied().unwrap_or(0.0);
+            let peak = peaks.get(i).copied().unwrap_or(0.0);
+            if peak <= height + PEAK_MARKER_GAP_DB {
+                continue;
+            }
+            let peak_norm = (peak / MAX_DB_VALUE).clamp(0.0, 1.0);
+            // The radial layout keeps a 10 px margin, so a marker pinned to the
+            // top of the scale still fits without being clipped.
+            let peak_r = inner_r + peak_norm * max_amp;
+            let angle =
+                std::f32::consts::FRAC_PI_2 + i as f32 / NUM_BARS as f32 * TAU + rotation;
+            let dir = Vec2::new(angle.cos(), angle.sin());
+            let peak_color = spectrum_color(peak_norm);
+            painter.circle_filled(
+                center + dir * peak_r,
+                dot_r,
+                theme::alpha(peak_color, 190),
+            );
+        }
     }
 }
 
@@ -176,8 +204,10 @@ fn paint_radial_led(
     let half_w = cell_w * 0.5;
 
     for i in 0..NUM_BARS {
-        let norm = (bars.get(i).copied().unwrap_or(0.0) / MAX_DB_VALUE).clamp(0.0, 1.0);
-        let peak_norm = (peaks.get(i).copied().unwrap_or(0.0) / MAX_DB_VALUE).clamp(0.0, 1.0);
+        let bar_value = bars.get(i).copied().unwrap_or(0.0);
+        let peak_value = peaks.get(i).copied().unwrap_or(0.0);
+        let norm = (bar_value / MAX_DB_VALUE).clamp(0.0, 1.0);
+        let peak_norm = (peak_value / MAX_DB_VALUE).clamp(0.0, 1.0);
         if norm <= 0.01 && peak_norm <= 0.01 {
             continue;
         }
@@ -207,10 +237,90 @@ fn paint_radial_led(
             ));
         }
 
-        if show_peaks && peak_norm > norm + 0.012 {
-            let peak_r = inner_r + peak_norm * max_amp;
-            let r0 = (peak_r - cell_len * 0.5).max(inner_r);
-            let r1 = (peak_r + cell_len * 0.5).min(inner_r + max_amp);
+        if show_peaks && peak_value > bar_value + PEAK_MARKER_GAP_DB {
+            // Place the whole cell inside the ring. Clamping the centre instead
+            // of the outer edge stops the marker from losing half its length
+            // when the peak sits at the top of the scale.
+            let half = cell_len * 0.5;
+            let outer = inner_r + max_amp;
+            let low = inner_r + half;
+            let high = (outer - half).max(low);
+            let peak_r = (inner_r + peak_norm * max_amp).clamp(low, high);
+            let r0 = peak_r - half;
+            let r1 = (peak_r + half).min(outer);
+            let p0 = center + dir * r0 - tangent;
+            let p1 = center + dir * r1 - tangent;
+            let p2 = center + dir * r1 + tangent;
+            let p3 = center + dir * r0 + tangent;
+            painter.add(Shape::convex_polygon(
+                vec![p0, p1, p2, p3],
+                spectrum_color(1.0),
+                Stroke::NONE,
+            ));
+        }
+    }
+}
+
+// DOT MATRIX radial spectrum. The cells keep the dot-matrix grain (same pitch
+// and dot size as the background), but each cell is oriented along its spoke
+// so the ring reads as a radial meter instead of a face-on pixel grid.
+fn paint_radial_dots(
+    painter: &Painter,
+    rect: Rect,
+    center: Pos2,
+    inner_r: f32,
+    max_amp: f32,
+    bars: &[f32],
+    peaks: &[f32],
+    show_peaks: bool,
+    rotation: f32,
+) {
+    let ppp = painter.ctx().pixels_per_point().max(1.0);
+    let (step, dot) = dot_metrics_for_rect(rect, ppp);
+    let half = dot * 0.5;
+    let steps = ((max_amp / step).floor() as usize).max(1);
+
+    for i in 0..NUM_BARS {
+        let bar_value = bars.get(i).copied().unwrap_or(0.0);
+        let peak_value = peaks.get(i).copied().unwrap_or(0.0);
+        let norm = (bar_value / MAX_DB_VALUE).clamp(0.0, 1.0);
+        let peak_norm = (peak_value / MAX_DB_VALUE).clamp(0.0, 1.0);
+        if norm <= 0.01 && peak_norm <= 0.01 {
+            continue;
+        }
+        let angle = std::f32::consts::FRAC_PI_2 + i as f32 / NUM_BARS as f32 * TAU + rotation;
+        let dir = Vec2::new(angle.cos(), angle.sin());
+        let tangent = Vec2::new(-dir.y, dir.x) * half;
+        let lit = if norm <= 0.01 {
+            0
+        } else {
+            ((norm * steps as f32).ceil() as usize).clamp(1, steps)
+        };
+
+        for cell in 0..lit {
+            let r0 = inner_r + cell as f32 * step;
+            let r1 = (r0 + dot).min(inner_r + max_amp);
+            let t = ((cell + 1) as f32 / steps as f32).clamp(0.0, 1.0);
+            let level = (t * 3.0).round() / 3.0;
+            let p0 = center + dir * r0 - tangent;
+            let p1 = center + dir * r1 - tangent;
+            let p2 = center + dir * r1 + tangent;
+            let p3 = center + dir * r0 + tangent;
+            painter.add(Shape::convex_polygon(
+                vec![p0, p1, p2, p3],
+                spectrum_color(level),
+                Stroke::NONE,
+            ));
+        }
+
+        if show_peaks && peak_value > bar_value + PEAK_MARKER_GAP_DB {
+            // Keep the whole marker inside the ring at the top of the scale.
+            let outer = inner_r + max_amp;
+            let low = inner_r + half;
+            let high = (outer - half).max(low);
+            let peak_r = (inner_r + peak_norm * max_amp).clamp(low, high);
+            let r0 = peak_r - half;
+            let r1 = (peak_r + half).min(outer);
             let p0 = center + dir * r0 - tangent;
             let p1 = center + dir * r1 - tangent;
             let p2 = center + dir * r1 + tangent;
@@ -234,44 +344,71 @@ struct SpectrumGrid {
     signal_rows: usize,
 }
 
-fn spectrum_grid(rect: Rect, cell: f32) -> Option<SpectrumGrid> {
-    spectrum_grid_cells(rect, cell, cell)
+/// One background cell, quantised to an even number of device pixels. Keeping
+/// the cell even means each half-cell is an exact device pixel, so the dot
+/// lattice and the grid lines land on the same boundaries at any DPI.
+fn cell_dev(ppp: f32) -> usize {
+    let mut cell = (LED_CELL * ppp.max(1.0)).round().max(2.0) as usize;
+    if cell % DOTS_PER_CELL != 0 {
+        cell += 1;
+    }
+    cell
 }
 
-fn spectrum_grid_cells(rect: Rect, cell_width: f32, cell_height: f32) -> Option<SpectrumGrid> {
+/// The shared background lattice used by both the default LED wall and the dot
+/// matrix. One cell is exactly 2x2 dot pixels.
+fn pixel_grid(rect: Rect, ppp: f32) -> Option<SpectrumGrid> {
+    let ppp = ppp.max(1.0);
     let side_margin = 12.0;
     let top_margin = 24.0;
     let bottom_margin = 24.0;
     let max_w = (rect.width() - side_margin * 2.0).max(0.0);
     let max_h = (rect.height() - top_margin - bottom_margin).max(0.0);
-    if max_w < cell_width * 8.0 || max_h < cell_height * 4.0 {
+    let cell_px = cell_dev(ppp);
+    let cols = ((max_w * ppp) as usize) / cell_px;
+    let rows = ((max_h * ppp) as usize) / cell_px;
+    if cols < 8 || rows < 4 {
         return None;
     }
-
-    let rows = ((max_h / cell_height).floor() as usize).max(4);
-    let cell_h = max_h / rows as f32;
-    // Preserve the requested cell aspect so the dot lattice keeps the same
-    // proportions across different window sizes.
-    let cell_w = cell_h * (cell_width / cell_height);
-    let cols = (max_w / cell_w).floor() as usize;
-    if cols < 8 {
-        return None;
-    }
-    let panel_w = cols as f32 * cell_w;
-    let panel_left = rect.left() + side_margin + (max_w - panel_w) * 0.5;
-    let signal_rows = (((max_h * 0.40) / cell_h).round() as usize).clamp(1, rows);
-    let panel = Rect::from_min_max(
-        Pos2::new(panel_left, rect.top() + top_margin),
-        Pos2::new(panel_left + panel_w, rect.bottom() - bottom_margin),
-    );
+    let cell = cell_px as f32 / ppp;
+    let panel_w = cols as f32 * cell;
+    let panel_h = rows as f32 * cell;
+    let panel_left =
+        ((rect.left() + side_margin + (max_w - panel_w) * 0.5) * ppp).round() / ppp;
+    let panel_bottom = ((rect.bottom() - bottom_margin) * ppp).round() / ppp;
+    let signal_rows = (((panel_h * 0.40) / cell).round() as usize).clamp(1, rows);
     Some(SpectrumGrid {
-        rect: panel,
+        rect: Rect::from_min_max(
+            Pos2::new(panel_left, panel_bottom - panel_h),
+            Pos2::new(panel_left + panel_w, panel_bottom),
+        ),
         cols,
         rows,
-        cell_w,
-        cell_h,
+        cell_w: cell,
+        cell_h: cell,
         signal_rows,
     })
+}
+
+/// The dot pitch is exactly half a cell, so two dots fit side by side and two
+/// stack vertically inside every grid cell.
+fn dot_metrics(grid: &SpectrumGrid, ppp: f32) -> (f32, f32) {
+    let step = grid.cell_w / DOTS_PER_CELL as f32;
+    let step_px = (step * ppp).round().max(1.0);
+    let dot_px = (step_px * 0.58).round().clamp(1.0, step_px - 1.0);
+    (step_px / ppp, dot_px / ppp)
+}
+
+/// Metrics for elements that do not have a grid at hand (the core and the
+/// radial bars). Falls back to the nominal cell size in very small windows.
+fn dot_metrics_for_rect(rect: Rect, ppp: f32) -> (f32, f32) {
+    let ppp = ppp.max(1.0);
+    if let Some(grid) = pixel_grid(rect, ppp) {
+        return dot_metrics(&grid, ppp);
+    }
+    let step_px = (cell_dev(ppp) / DOTS_PER_CELL) as f32;
+    let dot_px = (step_px * 0.58).round().clamp(1.0, step_px - 1.0);
+    (step_px / ppp, dot_px / ppp)
 }
 
 fn painted_grid(painter: &Painter, grid: &SpectrumGrid) {
@@ -376,8 +513,8 @@ fn mapped_bar(bars: &[f32], cols: usize, col: usize) -> f32 {
 // Pixel LED wall behind the radial spectrum: frequency left-to-right,
 // amplitude bottom-to-top, quantised into discrete cells.
 pub fn paint_bar_spectrum(painter: &Painter, rect: Rect, bars: &[f32], _playing: bool) {
-    let cell = LED_CELL;
-    let Some(grid) = spectrum_grid(rect, cell) else {
+    let ppp = painter.ctx().pixels_per_point().max(1.0);
+    let Some(grid) = pixel_grid(rect, ppp) else {
         return;
     };
     painted_grid(painter, &grid);
@@ -414,31 +551,24 @@ pub fn paint_bar_spectrum(painter: &Painter, rect: Rect, bars: &[f32], _playing:
 // rendered as a uniform field of small square dots. Direct dots avoid the
 // sub-pixel seams and moiré produced by rasterizing tiny glyphs.
 pub fn paint_dot_stream(painter: &Painter, rect: Rect, bars: &[f32]) {
-    let Some(grid) = spectrum_grid_cells(rect, DOT_CELL_W, DOT_CELL_H) else {
+    let ppp = painter.ctx().pixels_per_point().max(1.0);
+    let Some(grid) = pixel_grid(rect, ppp) else {
         return;
     };
-    // The faint lattice and frequency labels follow the default style so both
-    // modes share the same backdrop; only the lit dots use the dot cell grid.
-    let backdrop = spectrum_grid(rect, LED_CELL);
-    let bg_grid = backdrop.as_ref().unwrap_or(&grid);
-    painted_grid(painter, bg_grid);
-    painted_labels(painter, rect, bg_grid);
+    // Both background styles share the same lattice. The dots are anchored to
+    // its bottom-left corner so every grid cell contains exactly 2x2 dots.
+    painted_grid(painter, &grid);
+    painted_labels(painter, rect, &grid);
 
     if !bars.iter().any(|bar| *bar > 0.01) {
         return;
     }
 
-    let ppp = painter.ctx().pixels_per_point().max(1.0);
-    let snap = |value: f32| (value * ppp).round() / ppp;
-    let step_px = ((grid.cell_h * 0.25) * ppp).round().clamp(2.0, 24.0);
-    let step = step_px / ppp;
-    let dot_px = (step_px * 0.58).round().clamp(1.0, step_px - 1.0);
-    let dot = dot_px / ppp;
-
-    let cols = (grid.rect.width() / step).floor().max(1.0) as usize;
-    let rows = ((grid.rect.height() * 0.40) / step).floor().max(1.0) as usize;
-    let left = snap(grid.rect.center().x - cols as f32 * step * 0.5);
-    let bottom = snap(grid.rect.bottom());
+    let (step, dot) = dot_metrics(&grid, ppp);
+    let cols = grid.cols * DOTS_PER_CELL;
+    let rows = grid.signal_rows * DOTS_PER_CELL;
+    let left = grid.rect.left();
+    let bottom = grid.rect.bottom();
     let center = rect.center();
     let core_r = core_radius(rect);
     let square = Vec2::splat(dot);
@@ -495,20 +625,21 @@ pub fn paint_core(
         // never rotates or scales; light beats change its brightness and heavy
         // beats also send a dotted ring outwards.
         let kick = if pulse_enabled { visual.kick } else { 0.0 };
-        if let Some(grid) = spectrum_grid_cells(rect, DOT_CELL_W, DOT_CELL_H) {
-            let age = if pulse_enabled { beat_age } else { 1.0 };
-            let strength = if pulse_enabled { ring_strength } else { 0.0 };
-            paint_core_dots(
-                painter,
-                &grid,
-                center,
-                base_disc_r,
-                playing,
-                kick,
-                age,
-                strength,
-            );
-        }
+        let ppp = painter.ctx().pixels_per_point().max(1.0);
+        let (step, dot) = dot_metrics_for_rect(rect, ppp);
+        let age = if pulse_enabled { beat_age } else { 1.0 };
+        let strength = if pulse_enabled { ring_strength } else { 0.0 };
+        paint_core_dots(
+            painter,
+            center,
+            base_disc_r,
+            playing,
+            kick,
+            age,
+            strength,
+            step,
+            dot,
+        );
     } else {
         paint_core_classic(painter, center, visual, playing, pulse_enabled, base_disc_r);
     }
@@ -836,22 +967,19 @@ fn conical_color(t: f32, ring: Color32, hi: Color32, deep: Color32, main_a: u8) 
 /// Direct dots keep the same matrix look with an exact uniform pitch.
 fn paint_core_dots(
     painter: &Painter,
-    grid: &SpectrumGrid,
     center: Pos2,
     disc_r: f32,
     playing: bool,
     kick: f32,
     beat_age: f32,
     ring_strength: f32,
+    step: f32,
+    dot: f32,
 ) {
     const PULSE_LIFE: f32 = 0.42;
 
     let ppp = painter.ctx().pixels_per_point().max(1.0);
     let snap = |value: f32| (value * ppp).round() / ppp;
-    let step_px = ((grid.cell_h * 0.25) * ppp).round().clamp(2.0, 24.0);
-    let step = step_px / ppp;
-    let dot_px = (step_px * 0.58).round().clamp(1.0, step_px - 1.0);
-    let dot = dot_px / ppp;
     let center = Pos2::new(snap(center.x), snap(center.y));
 
     let t = (beat_age / PULSE_LIFE).clamp(0.0, 1.0);

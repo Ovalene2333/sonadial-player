@@ -2255,6 +2255,7 @@ impl SonadialApp {
                             rotation,
                             self.radial_scale,
                             self.led_bars,
+                            self.dot_style(),
                         );
                     }
 
