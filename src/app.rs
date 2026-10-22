@@ -2663,7 +2663,7 @@ impl SonadialApp {
                     painter.text(
                         Pos2::new(rect.left() + 18.0, rect.top() + TOP_LABEL_Y),
                         Align2::LEFT_CENTER,
-                        format!("PIANO  {state}{analysis_state}{key}"),
+                        format!("PIANO (DEV)  {state}{analysis_state}{key}"),
                         mono(10.0),
                         theme::text_dim(),
                     );
@@ -3852,7 +3852,7 @@ impl SonadialApp {
                                         }
                                         if tui_button(
                                             ui,
-                                            &toggle_label("PIANO", self.piano_mode),
+                                            &toggle_label("PIANO (DEV)", self.piano_mode),
                                             style_w,
                                         )
                                         .clicked()
