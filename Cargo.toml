@@ -2,8 +2,9 @@
 name = "sonadial_player"
 version = "0.1.0"
 edition = "2021"
-description = "Sonadial Player - geek-style native music player with circular spectrum"
+description = "Looks like a TUI, runs native. A terminal-styled music player with a beat-reactive radial spectrum, typewriter lyrics and gradient themes picked from each song's sound. Rust, single exe, lightweight."
 authors = ["Ovalene"]
+repository = "https://github.com/Ovalene2333/sonadial-player"
 
 [dependencies]
 anyhow = "1.0"
