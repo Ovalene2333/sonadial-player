@@ -11,6 +11,7 @@ use eframe::egui::{
     Pos2, Rect, Response, RichText, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui,
     Vec2, ViewportCommand,
 };
+use eframe::egui::scroll_area::ScrollBarVisibility;
 
 use crate::audio::AudioEngine;
 use crate::auto_theme::{self, Fade, Mood};
@@ -148,6 +149,7 @@ enum ThemeAction {
 
 enum Action {
     Play(usize),
+    Select(usize),
     AddFiles,
     Toggle,
     Next,
@@ -229,6 +231,8 @@ pub struct SonadialApp {
     offline_last_pos: Option<f64>,
     playlist: Vec<TrackEntry>,
     current: Option<usize>,
+    /// Row marked by a single click; double-click plays it.
+    selected_track: Option<usize>,
     lrc_map: HashMap<String, PathBuf>,
     next_queue: VecDeque<PathBuf>,
     history: Vec<PathBuf>,
@@ -247,6 +251,10 @@ pub struct SonadialApp {
     default_volume: f32,
     track_volumes: HashMap<String, f32>,
     search: String,
+    /// Custom track-list scrollbar: pending offset for the next frame and the
+    /// pointer's grab offset inside the thumb.
+    track_scroll_target: Option<f32>,
+    track_scroll_grab: Option<f32>,
     samples: Vec<f32>,
     duration: f64,
     format_label: String,
@@ -401,6 +409,7 @@ impl SonadialApp {
             offline_last_pos: None,
             playlist,
             current,
+            selected_track: current,
             lrc_map,
             next_queue: VecDeque::new(),
             history: Vec::new(),
@@ -422,6 +431,8 @@ impl SonadialApp {
             default_volume,
             track_volumes,
             search: String::new(),
+            track_scroll_target: None,
+            track_scroll_grab: None,
             samples: Vec::with_capacity(8192),
             duration: 0.0,
             format_label: "---".to_owned(),
@@ -708,6 +719,7 @@ impl SonadialApp {
         for action in actions {
             match action {
                 Action::Play(index) => self.play_index(index),
+                Action::Select(index) => self.selected_track = Some(index),
                 Action::QueueNext(index) => self.queue_next(index),
                 Action::ImportLrc(index) => self.import_lrc(index),
                 Action::ClearLrc(index) => self.clear_lrc(index),
@@ -1751,6 +1763,13 @@ impl SonadialApp {
         }
 
         self.playlist.remove(index);
+        if self.selected_track == Some(index) {
+            self.selected_track = None;
+        } else if let Some(selected) = self.selected_track {
+            if selected > index {
+                self.selected_track = Some(selected - 1);
+            }
+        }
         self.track_volumes.remove(&key);
         self.next_queue.retain(|queued| queued != &path);
         self.rebuild_shuffle_order();
@@ -2226,16 +2245,32 @@ impl SonadialApp {
                 ui.add_space(tokens::SPACE_2);
                 ui.horizontal(|ui| {
                     ui.add_space(tokens::GUTTER);
-                    ui.label(
-                        RichText::new("find:")
-                            .font(mono(13.0))
-                            .color(theme::text_dim()),
+                    let label_font = mono(13.0);
+                    let label_w = ui
+                        .painter()
+                        .layout_no_wrap("find:".to_owned(), label_font.clone(), theme::text_dim())
+                        .size()
+                        .x;
+                    let (label_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(label_w, tokens::FIELD_H),
+                        Sense::hover(),
+                    );
+                    // A singleline TextEdit draws its text two pixels below a
+                    // plain label centred on the same row; drop the prompt to
+                    // the same baseline instead of adding another centring pass.
+                    ui.painter().text(
+                        Pos2::new(label_rect.left(), label_rect.center().y + 2.0),
+                        Align2::LEFT_CENTER,
+                        "find:",
+                        label_font,
+                        theme::text_dim(),
                     );
                     ui.add_sized(
                         [(inner_w - 48.0).max(40.0), tokens::FIELD_H],
                         TextEdit::singleline(&mut self.search)
                             .hint_text("title...")
                             .font(title(13.0))
+                            .align(Align2::LEFT_CENTER)
                             .text_color(theme::text_hi())
                             .frame(Frame::NONE),
                     );
@@ -2283,48 +2318,57 @@ impl SonadialApp {
                     })
                     .map(|(index, _)| index)
                     .collect();
-                let mut scroll_style = (**ui.style()).clone();
-                scroll_style.visuals.widgets.inactive.bg_fill = theme::text_dim();
-                scroll_style.visuals.widgets.hovered.bg_fill = theme::text_hi();
-                scroll_style.visuals.widgets.active.bg_fill = theme::text_hi();
-                scroll_style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, theme::line());
-                scroll_style.spacing.scroll = egui::style::ScrollStyle::solid();
-                scroll_style.spacing.scroll.bar_width = tokens::SPACE_TIGHT;
-                scroll_style.spacing.scroll.bar_inner_margin = tokens::HAIRLINE;
-                scroll_style.spacing.scroll.bar_outer_margin = tokens::SPACE_1;
-                ui.scope(|ui| {
-                    ui.set_style(scroll_style);
-                    // `show_rows` adds the item spacing itself; pass the bare
-                    // row height so scrolling stays aligned with the layout.
-                    ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show_rows(ui, tokens::ROW_H, filtered.len(), |ui, rows| {
-                            ui.set_width(inner_w);
+                let scroll_offset = self.track_scroll_target.take();
+                let mut scroll = ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .scroll_bar_visibility(ScrollBarVisibility::AlwaysHidden);
+                if let Some(offset) = scroll_offset {
+                    scroll = scroll.vertical_scroll_offset(offset);
+                }
+                // `show_rows` adds the item spacing itself; pass the bare row
+                // height so scrolling stays aligned with the layout.
+                let output = scroll.show_rows(ui, tokens::ROW_H, filtered.len(), |ui, rows| {
+                    ui.set_width((inner_w - 14.0).max(40.0));
                             let row_painter = ui.painter().clone();
                             for visible in rows {
                                 let index = filtered[visible];
                                 let track = &self.playlist[index];
                                 let selected = self.current == Some(index);
+                                let focused = self.selected_track == Some(index);
                                 let playing = selected && self.playing;
                                 let (row_rect, response) = ui.allocate_exact_size(
                                     Vec2::new(ui.available_width(), tokens::ROW_H),
                                     Sense::click(),
                                 );
-                                if response.hovered() {
-                                    row_painter.rect_filled(
-                                        row_rect,
-                                        tokens::RADIUS,
-                                        theme::surface_hi(),
+                                if response.hovered() && !selected && !focused {
+                                    row_painter.rect_stroke(
+                                        row_rect.shrink(0.5),
+                                        0.0,
+                                        Stroke::new(
+                                            1.0,
+                                            theme::alpha(theme::text_hi(), 120),
+                                        ),
+                                        StrokeKind::Inside,
                                     );
                                 }
                                 if selected {
-                                    row_painter.rect_filled(
-                                        Rect::from_min_size(
-                                            Pos2::new(row_rect.left(), row_rect.top() + 4.0),
-                                            Vec2::new(2.0, row_rect.height() - 8.0),
-                                        ),
-                                        tokens::RADIUS,
-                                        theme::text_hi(),
+                                    // Inverse video: the current row becomes one
+                                    // solid terminal block instead of a faint tint.
+                                    row_painter.rect_filled(row_rect, 0.0, theme::text_hi());
+                                }
+                                if focused {
+                                    // Single click selects; a wireframe keeps the
+                                    // selection visible on plain and inverse rows.
+                                    let color = if selected {
+                                        theme::bg()
+                                    } else {
+                                        theme::text_hi()
+                                    };
+                                    row_painter.rect_stroke(
+                                        row_rect.shrink(1.0),
+                                        0.0,
+                                        Stroke::new(1.0, color),
+                                        StrokeKind::Inside,
                                     );
                                 }
                                 let marker = format!(
@@ -2340,7 +2384,7 @@ impl SonadialApp {
                                     marker,
                                     mono(13.0),
                                     if selected {
-                                        theme::text_hi()
+                                        theme::bg()
                                     } else {
                                         theme::text_dim()
                                     },
@@ -2364,7 +2408,7 @@ impl SonadialApp {
                                     fitted,
                                     title_font,
                                     if selected {
-                                        theme::text_hi()
+                                        theme::bg()
                                     } else {
                                         theme::text()
                                     },
@@ -2385,14 +2429,17 @@ impl SonadialApp {
                                     meta,
                                     mono(12.0),
                                     if selected {
-                                        theme::text()
+                                        theme::mix(theme::bg(), theme::text_hi(), 0.22)
                                     } else {
                                         theme::text_dim()
                                     },
                                 );
 
-                                if response.clicked() {
+                                if response.double_clicked() {
+                                    actions.push(Action::Select(index));
                                     actions.push(Action::Play(index));
+                                } else if response.clicked() {
+                                    actions.push(Action::Select(index));
                                 }
                                 let response = response.on_hover_cursor(CursorIcon::PointingHand);
 
@@ -2460,7 +2507,107 @@ impl SonadialApp {
                                 );
                             }
                         });
-                });
+
+                // TUI scrollbar: a dashed `│` track with one continuous square
+                // thumb. It stays faint until the pointer reaches the right
+                // edge, then becomes prominent.
+                let viewport = output.inner_rect;
+                let content_h = output.content_size.y;
+                let max_offset = (content_h - viewport.height()).max(0.0);
+                if max_offset > 0.5 {
+                    let bar_w = 14.0;
+                    let bar_x = viewport.right() - bar_w * 0.5;
+                    let thumb_w = 4.0;
+                    let thumb_h = (viewport.height() * viewport.height() / content_h)
+                        .clamp(viewport.height().min(24.0), viewport.height());
+                    let offset = output.state.clamped_offset().y.clamp(0.0, max_offset);
+                    let thumb_y = viewport.top()
+                        + (viewport.height() - thumb_h) * (offset / max_offset);
+                    let thumb_rect = Rect::from_min_size(
+                        Pos2::new(bar_x - thumb_w * 0.5, thumb_y),
+                        Vec2::new(thumb_w, thumb_h),
+                    );
+                    let thumb_hit = Rect::from_min_size(
+                        Pos2::new(bar_x - bar_w * 0.5, thumb_y),
+                        Vec2::new(bar_w, thumb_h),
+                    );
+                    let track_hit = Rect::from_min_size(
+                        Pos2::new(bar_x - bar_w * 0.5, viewport.top()),
+                        Vec2::new(bar_w, viewport.height()),
+                    );
+                    let track_response = ui.interact(
+                        track_hit,
+                        Id::new("tui-track-scrollbar"),
+                        Sense::click(),
+                    );
+                    let thumb_response = ui.interact(
+                        thumb_hit,
+                        Id::new("tui-track-scrollbar-thumb"),
+                        Sense::click_and_drag(),
+                    );
+
+                    if thumb_response.hovered() || thumb_response.dragged() {
+                        ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
+                    }
+                    let active = thumb_response.dragged() || thumb_response.hovered();
+                    let near = active
+                        || self.track_scroll_grab.is_some()
+                        || ui
+                            .input(|input| input.pointer.hover_pos())
+                            .is_some_and(|pos| {
+                                viewport.expand2(Vec2::new(28.0, 0.0)).contains(pos)
+                            });
+                    let thumb_color = if active {
+                        theme::text_hi()
+                    } else if near {
+                        theme::text_dim()
+                    } else {
+                        theme::alpha(theme::text_dim(), 45)
+                    };
+                    let track_color =
+                        theme::alpha(theme::text_dim(), if near { 95 } else { 24 });
+                    let painter = ui.painter().with_clip_rect(viewport);
+                    let rows = (viewport.height() / 12.0).floor().max(1.0) as usize;
+                    for i in 0..rows {
+                        painter.text(
+                            Pos2::new(bar_x, viewport.top() + (i as f32 + 0.5) * 12.0),
+                            Align2::CENTER_CENTER,
+                            "│",
+                            mono(12.0),
+                            track_color,
+                        );
+                    }
+                    painter.rect_filled(thumb_rect, 0.0, thumb_color);
+
+                    if thumb_response.drag_started() {
+                        let pointer_y = ui
+                            .input(|input| input.pointer.interact_pos())
+                            .map_or(thumb_rect.top(), |pos| pos.y);
+                        self.track_scroll_grab =
+                            Some((pointer_y - thumb_rect.top()).clamp(0.0, thumb_h));
+                    }
+                    if thumb_response.dragged() {
+                        if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
+                            let grab = self.track_scroll_grab.unwrap_or(thumb_h * 0.5);
+                            let travel = (viewport.height() - thumb_h).max(1.0);
+                            let frac = ((pointer.y - grab - viewport.top()) / travel)
+                                .clamp(0.0, 1.0);
+                            self.track_scroll_target = Some(frac * max_offset);
+                        }
+                    }
+                    if thumb_response.drag_stopped() {
+                        self.track_scroll_grab = None;
+                    }
+                    if track_response.clicked() && !thumb_response.hovered() {
+                        if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
+                            let travel = (viewport.height() - thumb_h).max(1.0);
+                            let frac = ((pointer.y - viewport.top() - thumb_h * 0.5)
+                                / travel)
+                                .clamp(0.0, 1.0);
+                            self.track_scroll_target = Some(frac * max_offset);
+                        }
+                    }
+                }
             });
         actions
     }
