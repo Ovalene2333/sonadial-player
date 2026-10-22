@@ -68,8 +68,8 @@ fn download(
         .timeout_write(REQUEST_TIMEOUT)
         .build();
 
-    let bvid = match extract_bvid(input) {
-        Ok(bvid) => bvid,
+    let (bvid, page) = match extract_bvid(input) {
+        Ok(bvid) => (bvid, extract_page(input)),
         Err(_) if input.starts_with("http://") || input.starts_with("https://") => {
             status(sender, "RESOLVING SHORT LINK");
             let response = agent
@@ -78,7 +78,11 @@ fn download(
                 .set("Referer", "https://www.bilibili.com/")
                 .call()
                 .context("无法解析 B 站短链接")?;
-            extract_bvid(response.get_url()).context("短链接中没有找到 BV 号")?
+            let url = response.get_url().to_owned();
+            (
+                extract_bvid(&url).context("短链接中没有找到 BV 号")?,
+                extract_page(&url).or_else(|| extract_page(input)),
+            )
         }
         Err(error) => return Err(error),
     };
@@ -100,14 +104,7 @@ fn download(
     let data = view
         .get("data")
         .ok_or_else(|| anyhow!("视频信息缺少 data"))?;
-    let title = data
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("bilibili_audio");
-    let cid = data
-        .get("cid")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| anyhow!("视频信息缺少 cid"))?;
+    let (title, cid) = select_page(data, page)?;
 
     if cancel.load(Ordering::Relaxed) {
         return Err(anyhow!("cancelled"));
@@ -132,7 +129,7 @@ fn download(
     let source = best_audio_source(&play).ok_or_else(|| anyhow!("没有找到可下载的音轨"))?;
 
     fs::create_dir_all(output_dir).context("无法创建下载目录")?;
-    let output = unique_output(output_dir, &safe_filename(title), "m4a");
+    let output = unique_output(output_dir, &safe_filename(&title), "m4a");
     let temp = std::env::temp_dir().join(format!(
         "sonadial-bilibili-{}-{}.m4a",
         std::process::id(),
@@ -219,6 +216,84 @@ fn extract_bvid(input: &str) -> Result<String> {
     }
 
     Err(anyhow!("无法从输入中提取 BV 号"))
+}
+
+/// Reads the `p` query parameter (1-based part number) from a Bilibili URL.
+fn extract_page(input: &str) -> Option<u32> {
+    let query = input.split_once('?')?.1;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("p=") {
+            return value.parse::<u32>().ok().filter(|page| *page > 0);
+        }
+    }
+    None
+}
+
+/// Whether a `part` value is a real title. Bilibili fills this field with
+/// placeholders for untouched uploads: empty, `Untitled`, a raw filename such
+/// as `song.mp4`, or a generated `studio_video_<timestamp>` name.
+fn usable_part(part: &str) -> bool {
+    if part.is_empty() || part.starts_with("studio_video_") {
+        return false;
+    }
+    if part.eq_ignore_ascii_case("untitled") {
+        return false;
+    }
+    let lower = part.to_ascii_lowercase();
+    const VIDEO_EXTS: [&str; 9] = [
+        ".mp4", ".flv", ".mkv", ".avi", ".wmv", ".mov", ".mpg", ".mpeg", ".ts",
+    ];
+    !VIDEO_EXTS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Picks the requested part of a multi-P video and returns its title and cid.
+/// Multi-part videos use the part title so downloads keep the individual song
+/// name; single-part uploads use the video title because their `part` field is
+/// an auto-generated placeholder such as `studio_video_1726668839685`.
+fn select_page(data: &Value, page: Option<u32>) -> Result<(String, u64)> {
+    let video_title = data
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("bilibili_audio");
+    let video_cid = data.get("cid").and_then(Value::as_u64);
+
+    let pages = data
+        .get("pages")
+        .and_then(Value::as_array)
+        .filter(|pages| !pages.is_empty());
+    let multi_part = pages.is_some_and(|pages| pages.len() > 1);
+    let selected = pages.and_then(|pages| {
+        let index = page.unwrap_or(1).max(1) as usize - 1;
+        pages.get(index).map(|item| (index + 1, item))
+    });
+
+    if let Some((fallback_number, item)) = selected {
+        let part = item
+            .get("part")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let page_number = item
+            .get("page")
+            .and_then(Value::as_u64)
+            .unwrap_or(fallback_number as u64);
+        let title = if multi_part {
+            if usable_part(part) {
+                part.to_owned()
+            } else {
+                // Keep unnamed parts distinct and sortable.
+                format!("{video_title}_P{page_number:02}")
+            }
+        } else {
+            video_title.to_owned()
+        };
+        if let Some(cid) = item.get("cid").and_then(Value::as_u64).or(video_cid) {
+            return Ok((title, cid));
+        }
+    }
+
+    let cid = video_cid.ok_or_else(|| anyhow!("视频信息缺少 cid"))?;
+    Ok((video_title.to_owned(), cid))
 }
 
 fn check_api(value: &Value, context: &str) -> Result<()> {
