@@ -157,6 +157,7 @@ enum Action {
     Volume(f32),
     CycleMode,
     ToggleSettings,
+    ToggleVisualMode,
     ToggleEq,
     OpenDownload,
     ToggleSidebar,
@@ -743,6 +744,19 @@ impl SonadialApp {
                     if self.show_settings {
                         self.show_eq = false;
                         self.show_download = false;
+                    }
+                }
+                Action::ToggleVisualMode => {
+                    if self.piano_mode {
+                        self.piano_mode = false;
+                        self.set_dot_style(false);
+                    } else if self.dot_style() {
+                        self.piano_mode = true;
+                        self.piano_history.clear();
+                        self.dirty = true;
+                    } else {
+                        self.piano_mode = false;
+                        self.set_dot_style(true);
                     }
                 }
                 Action::ToggleEq => {
@@ -2133,6 +2147,14 @@ impl SonadialApp {
                     actions.push(Action::ToggleEq);
                 }
                 x -= 38.0;
+                let mode_rect = Rect::from_min_size(
+                    Pos2::new(x - 58.0, cy - tokens::CONTROL_H * 0.5),
+                    Vec2::new(58.0, tokens::CONTROL_H),
+                );
+                if text_button(ui, "tui-mode", mode_rect, "[MODE]", 12.0).clicked() {
+                    actions.push(Action::ToggleVisualMode);
+                }
+                x -= 62.0;
 
                 let drag_left = brand_x + brand_w + tokens::GUTTER;
                 let drag_right = (x - tokens::SPACE_5).max(drag_left + 16.0);
@@ -3648,7 +3670,7 @@ impl SonadialApp {
                                     let style_w =
                                         ((ui.available_width() - gap * 2.0) / 3.0).max(88.0);
                                     ui.label(
-                                        RichText::new("STYLE")
+                                        RichText::new("MODE")
                                             .font(mono(12.0))
                                             .color(theme::text_dim()),
                                     );
