@@ -9,7 +9,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, VecModel};
+use slint::{ComponentHandle, Model, VecModel};
 
 use crate::audio::AudioEngine;
 use crate::auto_theme::{self, Fade, Mood};
@@ -144,7 +144,7 @@ impl Player {
             let path = PathBuf::from(path);
             let lrc = state
                 .lrc_map
-                .get(&path.to_string_lossy())
+                .get(path.to_string_lossy().as_ref())
                 .map(PathBuf::from);
             playlist.push(TrackEntry {
                 title: track_title(&path),
@@ -161,7 +161,7 @@ impl Player {
 
         let mut player = Self {
             engine,
-            analyzer: SpectrumEngine::new(config),
+            analyzer: SpectrumEngine::new(config.clone()),
             config,
             bars,
             playlist,
@@ -270,7 +270,7 @@ impl Player {
     fn spawn_analysis(&mut self, path: PathBuf) {
         self.generation += 1;
         let generation = self.generation;
-        let config = self.config;
+        let config = self.config.clone();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
@@ -470,7 +470,7 @@ impl Player {
                 let lrc = self
                     .state
                     .lrc_map
-                    .get(&path.to_string_lossy())
+                    .get(path.to_string_lossy().as_ref())
                     .map(PathBuf::from);
                 self.playlist.push(TrackEntry {
                     title: track_title(&path),
@@ -642,23 +642,24 @@ impl Player {
     }
 
     fn push_state(&mut self, ui: &Main) {
+        let theme = ui.global::<Theme>();
         let look = theme::current_look();
         let corners = look.gradient.unwrap_or([look.palette.bg; 4]);
         let [tl, tr, br, bl] = corners;
         let bg_top = theme::mix_rgb(tl, tr, 0.5);
         let bg_bottom = theme::mix_rgb(bl, br, 0.5);
-        ui.set_bg_top(rgb(bg_top));
-        ui.set_bg_bottom(rgb(bg_bottom));
-        ui.set_corner_tl(rgba(tl, 96));
-        ui.set_corner_br(rgba(br, 96));
-        ui.set_c_bg_deep(rgb(look.palette.bg_deep));
-        ui.set_c_surface(rgb(look.palette.surface));
-        ui.set_c_line(rgb(look.palette.line));
-        ui.set_c_text_hi(rgb(look.palette.text_hi));
-        ui.set_c_text(rgb(look.palette.text));
-        ui.set_c_text_dim(rgb(look.palette.text_dim));
-        ui.set_c_ring(rgba(theme::ink(210), 20));
-        ui.set_c_ring_hi(rgba(theme::ink(225), 110));
+        theme.set_bg_top(rgb(bg_top));
+        theme.set_bg_bottom(rgb(bg_bottom));
+        theme.set_corner_tl(rgba(tl, 96));
+        theme.set_corner_br(rgba(br, 96));
+        theme.set_c_bg_deep(rgb(look.palette.bg_deep));
+        theme.set_c_surface(rgb(look.palette.surface));
+        theme.set_c_line(rgb(look.palette.line));
+        theme.set_c_text_hi(rgb(look.palette.text_hi));
+        theme.set_c_text(rgb(look.palette.text));
+        theme.set_c_text_dim(rgb(look.palette.text_dim));
+        theme.set_c_ring(rgba(theme::ink(210), 20));
+        theme.set_c_ring_hi(rgba(theme::ink(225), 110));
 
         let bars = self.analyzer.bars();
         let peaks = self.analyzer.peaks();
@@ -669,12 +670,17 @@ impl Player {
             let peak = (peaks.get(index).copied().unwrap_or(0.0) / MAX_DB_VALUE)
                 .clamp(0.0, 1.0);
             let col = rgb(theme::ink(spectrum_grey(len)));
+            // Bar angle: start at the bottom like viz.rs and spin slowly.
+            let angle = std::f32::consts::FRAC_PI_2
+                + index as f32 / NUM_BARS as f32 * std::f32::consts::TAU
+                + self.ring_rotation;
             self.bars.set_row_data(
                 index,
                 BarData {
                     len,
                     peak: if show_peaks { peak } else { 0.0 },
-                    ang: index as f32 * 3.6,
+                    dx: angle.cos(),
+                    dy: angle.sin(),
                     col,
                 },
             );
@@ -682,7 +688,6 @@ impl Player {
         ui.set_pulse(self.ring_strength * (1.0 - self.beat_age));
         ui.set_beat_age(self.beat_age);
         ui.set_kick(self.visual.kick);
-        ui.set_ring_rotation(self.ring_rotation * 180.0 / std::f32::consts::PI);
         ui.set_radial_scale(self.state.radial_scale);
         ui.set_show_bg_spectrum(self.state.show_bg_spectrum);
         ui.set_show_radial(self.state.show_radial);
@@ -690,11 +695,12 @@ impl Player {
 
         let position = self.position();
         let duration = self.duration();
+        let paused = self.engine.is_paused();
         ui.set_time_text(format!(
             "{}/{}",
             short_time(position),
             short_time(duration)
-        ));
+        ).into());
         let status = if self.engine.info().is_none() {
             "[STANDBY]"
         } else if paused {
@@ -702,17 +708,18 @@ impl Player {
         } else {
             "[PLAYING]"
         };
-        ui.set_status_text(status.to_owned());
+        ui.set_status_text(status.to_owned().into());
         ui.set_paused(paused);
         ui.set_has_track(self.engine.info().is_some());
         ui.set_track_title(
             self.current
                 .and_then(|index| self.playlist.get(index))
                 .map(|track| track.title.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into(),
         );
-        ui.set_theme_label(self.theme_label());
-        ui.set_mode_label(self.mode().label().to_owned());
+        ui.set_theme_label(self.theme_label().into());
+        ui.set_mode_label(self.mode().label().to_owned().into());
         ui.set_volume(self.engine.volume());
         if duration > 0.0 {
             ui.set_progress((position / duration).clamp(0.0, 1.0) as f32);
@@ -725,8 +732,8 @@ impl Player {
 
     fn push_lyrics(&mut self, ui: &Main, position: f64) {
         let Some((index, active)) = self.lyric_index_at(position) else {
-            ui.set_lyric_current(String::new());
-            ui.set_lyric_next(String::new());
+            ui.set_lyric_current(String::new().into());
+            ui.set_lyric_next(String::new().into());
             ui.set_lyric_active(false);
             return;
         };
@@ -749,12 +756,13 @@ impl Player {
             let progress = ((position - start) / interval.max(0.4)).clamp(0.0, 1.0);
             (((progress * total as f64).floor() as usize).min(total)).min(total)
         };
-        ui.set_lyric_current(line.chars().take(count).collect::<String>());
+        ui.set_lyric_current(line.chars().take(count).collect::<String>().into());
         ui.set_lyric_next(
             self.lyrics
                 .get(index + 1)
                 .map(|line| line.text.clone())
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into(),
         );
         ui.set_lyric_active(active);
     }
@@ -763,16 +771,11 @@ impl Player {
 // ---------- helpers ----------
 
 fn rgb(rgb: Rgb) -> slint::Color {
-    slint::Color::from_rgb(rgb[0], rgb[1], rgb[2])
+    slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2])
 }
 
 fn rgba(rgb: Rgb, a: u8) -> slint::Color {
-    slint::Color::from_argb(
-        u32::from(a) << 24
-            | u32::from(rgb[0]) << 16
-            | u32::from(rgb[1]) << 8
-            | u32::from(rgb[2]),
-    )
+    slint::Color::from_argb_u8(a, rgb[0], rgb[1], rgb[2])
 }
 
 fn spectrum_grey(norm: f32) -> u8 {
@@ -866,8 +869,9 @@ pub fn run(initial: Option<PathBuf>) {
         std::iter::repeat(BarData {
             len: 0.0,
             peak: 0.0,
-            ang: 0.0,
-            col: slint::Color::from_rgb(0, 0, 0),
+            dx: 0.0,
+            dy: 0.0,
+            col: slint::Color::from_rgb_u8(0, 0, 0),
         })
         .take(NUM_BARS)
         .collect::<Vec<_>>(),

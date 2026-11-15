@@ -1,35 +1,12 @@
 // Sonadial Player — Slint software-rendered UI (slint-ui branch).
 // Geometry mirrors src/viz.rs: usable/258 scale, inner_r = 120*scale,
-// max_amp = 100*scale, 100 radial bars in greyscale instrument ink.
+// max_amp = 100*scale. Radial bars use the player's LED look: each bar is a
+// column of small cells along its radius direction (dx/dy come pre-computed
+// from Rust, including the slow ring spin) because the software renderer
+// cannot rotate plain rectangles.
 
-export struct BarData {
-    len: float,
-    peak: float,
-    ang: float,
-    col: color,
-}
-
-export component Main inherits Window {
-    width: 1180px;
-    height: 760px;
-    min-width: 880px;
-    min-height: 560px;
-    title: "Sonadial Player";
-    default-font-family: "Sarasa Mono SC";
-    background: transparent;
-
-    // ---------- data ----------
-    in-out property <[BarData]> bars;
-    in-out property <float> ring-rotation; // degrees, animated while playing
-    in-out property <float> radial-scale: 1.0;
-    in-out property <bool> show-bg-spectrum: true;
-    in-out property <bool> show-radial: true;
-    in-out property <bool> show-peaks: true;
-    in-out property <float> pulse: 0;   // 0..1 expanding beat ring intensity
-    in-out property <float> beat-age: 1; // 0..1 since last launched ring
-    in-out property <float> kick: 0;   // 0..1 live low-band energy
-
-    // ---------- colors (set from the Rust theme layer) ----------
+// Theme colors, shared by the window and every component.
+export global Theme {
     in-out property <color> bg-top;
     in-out property <color> bg-bottom;
     in-out property <color> corner-tl;
@@ -42,6 +19,60 @@ export component Main inherits Window {
     in-out property <color> c-text-dim;
     in-out property <color> c-ring;
     in-out property <color> c-ring-hi;
+}
+
+// Terminal-style text button.
+component Btn inherits Rectangle {
+    in property <string> label;
+    in property <bool> accent: false;
+    in property <bool> on: false;
+    callback clicked();
+    height: 22px;
+    min-width: 44px;
+    border-width: 1px;
+    border-radius: 3px;
+    border-color: ta.has-hover ? Theme.c-line : #00000000;
+    background: ta.has-hover ? Theme.c-surface : #00000000;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        font-size: 12px;
+        color: root.accent || root.on || ta.has-hover
+            ? Theme.c-text-hi : Theme.c-text-dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export struct BarData {
+    len: float,
+    peak: float,
+    dx: float,
+    dy: float,
+    col: color,
+}
+
+export component Main inherits Window {
+    width: 1180px;
+    height: 760px;
+    title: "Sonadial Player";
+    default-font-family: "Sarasa Mono SC";
+    background: transparent;
+
+    // ---------- data ----------
+    in-out property <[BarData]> bars;
+    in-out property <float> radial-scale: 1.0;
+    in-out property <bool> show-bg-spectrum: true;
+    in-out property <bool> show-radial: true;
+    in-out property <bool> show-peaks: true;
+    in-out property <float> pulse: 0;    // 0..1 expanding beat ring intensity
+    in-out property <float> beat-age: 1; // 0..1 since the last launched ring
+    in-out property <float> kick: 0;     // 0..1 live low-band energy
 
     // ---------- readout ----------
     in-out property <string> time-text: "0:00 / 0:00";
@@ -58,14 +89,16 @@ export component Main inherits Window {
     in-out property <float> volume: 0.78;
 
     // ---------- geometry (viz.rs mirror) ----------
-    property <length> usable: min(width, height) / 2 - 8px;
+    property <length> usable: min(self.width, self.height) / 2 - 8px;
     property <float> scale: clamp(usable / 1px / 258.0, 0.45, 2.4)
         * clamp(root.radial-scale, 0.7, 1.2);
     property <length> inner-r: min(120px * scale, usable * 0.75);
     property <length> max-amp: min(100px * scale, usable - inner-r - 2px);
-    property <length> bar-w: max(2.8px * scale, 1px);
-    property <length> peak-w: max(bar-w * 0.9, 1.5px);
+    property <length> cell-step: max-amp / 12;
+    property <length> cell-size: max(3.4px * scale, 2.8px);
+    property <length> peak-size: max(3px * scale, 2px);
     property <length> disc-r: inner-r * 0.669;
+    property <float> kick-scale: 1 + root.kick * 0.04;
 
     callback toggle-play();
     callback next-track();
@@ -79,11 +112,11 @@ export component Main inherits Window {
 
     // ============ background: 4-corner gradient approximation ============
     Rectangle {
-        background: @linear-gradient(180deg, root.bg-top, root.bg-bottom);
+        background: @linear-gradient(180deg, Theme.bg-top, Theme.bg-bottom);
     }
     Rectangle {
-        background: @linear-gradient(90deg, root.corner-tl 0%, #00000000 42%,
-            #00000000 58%, root.corner-br 100%);
+        background: @linear-gradient(90deg, Theme.corner-tl 0%, #00000000 42%,
+            #00000000 58%, Theme.corner-br 100%);
     }
 
     // ============ bottom spectrum field ============
@@ -113,61 +146,68 @@ export component Main inherits Window {
         height: root.inner-r * 2;
         border-radius: root.inner-r;
         border-width: max(1.5px * root.scale, 1px);
-        border-color: root.c-ring;
+        border-color: Theme.c-ring;
     }
     // Expanding beat ring.
     Rectangle {
         visible: root.show-radial && root.pulse > 0.02;
         opacity: root.pulse;
-        x: root.width / 2 - r.r;
-        y: root.height / 2 - r.r;
-        width: r.r * 2;
-        height: r.r * 2;
-        border-radius: r.r;
+        x: root.width / 2 - self.beat-r;
+        y: root.height / 2 - self.beat-r;
+        width: self.beat-r * 2;
+        height: self.beat-r * 2;
+        border-radius: self.beat-r;
         border-width: max(1px, root.pulse * 3px * root.scale);
-        border-color: root.c-ring-hi;
-        property <length> r: root.inner-r * (1.05 + root.beat-age * 0.45);
+        border-color: Theme.c-ring-hi;
+        property <length> beat-r: root.inner-r * (1.05 + root.beat-age * 0.45);
     }
-    // 100 radial bars, rotated around the window center.
-    for bar[i] in root.bars: Rectangle {
-        visible: root.show-radial && bar.len > 0.005;
-        width: root.bar-w;
-        height: max(2px, bar.len * root.max-amp);
-        x: root.width / 2 - self.width / 2;
-        y: root.height / 2 - root.inner-r - self.height;
-        rotation-angle: bar.ang * 1deg + root.ring-rotation * 1deg;
-        rotation-origin-x: self.width / 2;
-        rotation-origin-y: self.height + root.inner-r;
-        background: bar.col;
-        border-radius: self.width / 2;
+    // 100 radial LED bars: up to 12 cells per bar along the radius direction.
+    // Each bar gets a full-size transparent wrapper so the inner integer-range
+    // repeat keeps window coordinates.
+    for bar in root.bars: Rectangle {
+        width: root.width;
+        height: root.height;
+        for k in 12: Rectangle {
+            visible: root.show-radial
+                && (k * 1.0 + 1.0) <= bar.len * 12;
+            width: root.cell-size;
+            height: root.cell-size;
+            x: root.width / 2
+                + bar.dx * (root.inner-r + (k * 1.0 + 0.5) * root.cell-step)
+                - self.width / 2;
+            y: root.height / 2
+                + bar.dy * (root.inner-r + (k * 1.0 + 0.5) * root.cell-step)
+                - self.height / 2;
+            background: bar.col;
+            border-radius: self.width / 2;
+        }
     }
     // Peak markers.
-    for bar[i] in root.bars: Rectangle {
+    for bar in root.bars: Rectangle {
         visible: root.show-radial && root.show-peaks
             && bar.peak > bar.len + 0.012;
-        width: root.peak-w;
-        height: root.peak-w;
-        x: root.width / 2 - self.width / 2;
-        y: root.height / 2 - root.inner-r - bar.peak * root.max-amp
-            - self.height / 2 - 2px;
-        rotation-angle: bar.ang * 1deg + root.ring-rotation * 1deg;
-        rotation-origin-x: self.width / 2;
-        rotation-origin-y: self.height / 2 + root.inner-r
-            + bar.peak * root.max-amp + 2px;
+        width: root.peak-size;
+        height: root.peak-size;
+        x: root.width / 2
+            + bar.dx * (root.inner-r + bar.peak * root.max-amp)
+            - self.width / 2;
+        y: root.height / 2
+            + bar.dy * (root.inner-r + bar.peak * root.max-amp)
+            - self.height / 2;
         background: bar.col;
         border-radius: self.width / 2;
     }
 
     // ============ core dial ============
     Rectangle {
-        x: root.width / 2 - root.disc-r * (1 + root.kick * 0.04);
-        y: root.height / 2 - root.disc-r * (1 + root.kick * 0.04);
-        width: root.disc-r * 2 * (1 + root.kick * 0.04);
-        height: root.disc-r * 2 * (1 + root.kick * 0.04);
-        border-radius: root.disc-r * (1 + root.kick * 0.04);
-        background: root.c-bg-deep;
+        x: root.width / 2 - root.disc-r * root.kick-scale;
+        y: root.height / 2 - root.disc-r * root.kick-scale;
+        width: root.disc-r * 2 * root.kick-scale;
+        height: root.disc-r * 2 * root.kick-scale;
+        border-radius: root.disc-r * root.kick-scale;
+        background: Theme.c-bg-deep;
         border-width: 1px;
-        border-color: root.c-line;
+        border-color: Theme.c-line;
     }
     Text {
         text: root.time-text;
@@ -176,7 +216,7 @@ export component Main inherits Window {
         width: root.width;
         horizontal-alignment: center;
         font-size: max(9px, root.disc-r * 0.20);
-        color: root.c-text-hi;
+        color: Theme.c-text-hi;
     }
     Text {
         text: root.status-text;
@@ -185,7 +225,7 @@ export component Main inherits Window {
         width: root.width;
         horizontal-alignment: center;
         font-size: max(10px, root.disc-r * 0.15);
-        color: root.c-text-dim;
+        color: Theme.c-text-dim;
     }
 
     // ============ header ============
@@ -194,14 +234,14 @@ export component Main inherits Window {
         y: 12px;
         text: "SONADIAL";
         font-size: 12px;
-        color: root.c-text-dim;
+        color: Theme.c-text-dim;
     }
     Text {
         x: parent.width - self.width - 18px;
         y: 12px;
         text: root.theme-label;
         font-size: 12px;
-        color: root.c-text-dim;
+        color: Theme.c-text-dim;
     }
 
     // ============ lyrics (typewriter, top-left) ============
@@ -211,7 +251,7 @@ export component Main inherits Window {
         y: 40px;
         text: ">";
         font-size: 16px;
-        color: root.lyric-active ? root.c-text : root.c-text-dim;
+        color: root.lyric-active ? Theme.c-text : Theme.c-text-dim;
     }
     Rectangle {
         visible: root.has-track;
@@ -225,7 +265,7 @@ export component Main inherits Window {
             text: root.lyric-current;
             font-size: 16px;
             font-family: "Fusion Pixel 12px Mono latin";
-            color: root.lyric-active ? root.c-text-hi : root.c-text-dim;
+            color: root.lyric-active ? Theme.c-text-hi : Theme.c-text-dim;
         }
     }
     Text {
@@ -236,7 +276,7 @@ export component Main inherits Window {
         text: root.lyric-next;
         font-size: 12px;
         font-family: "Fusion Pixel 12px Mono latin";
-        color: root.c-text-dim;
+        color: Theme.c-text-dim;
         overflow: elide;
     }
 
@@ -250,14 +290,14 @@ export component Main inherits Window {
             y: 0;
             height: 2px;
             width: parent.width;
-            background: root.c-line;
+            background: Theme.c-line;
             opacity: 0.55;
         }
         Rectangle {
             y: 0;
             height: 2px;
             width: root.progress * parent.width;
-            background: root.c-text-hi;
+            background: Theme.c-text-hi;
         }
         TouchArea {
             y: -6px;
@@ -311,7 +351,7 @@ export component Main inherits Window {
             Text {
                 text: root.time-text;
                 font-size: 12px;
-                color: root.c-text-dim;
+                color: Theme.c-text-dim;
                 vertical-alignment: center;
             }
             // volume strip
@@ -321,14 +361,14 @@ export component Main inherits Window {
                     y: 12px;
                     height: 2px;
                     width: parent.width;
-                    background: root.c-line;
+                    background: Theme.c-line;
                     opacity: 0.6;
                 }
                 Rectangle {
                     y: 12px;
                     height: 2px;
                     width: root.volume * parent.width;
-                    background: root.c-text-hi;
+                    background: Theme.c-text-hi;
                 }
                 TouchArea {
                     mouse-cursor: pointer;
@@ -341,33 +381,4 @@ export component Main inherits Window {
             }
         }
     }
-}
-
-// Terminal-style text button.
-component Btn inherits Rectangle {
-    in property <string> label;
-    in property <bool> accent: false;
-    in property <bool> on: false;
-    callback clicked();
-    height: 22px;
-    border-width: 1px;
-    border-radius: 3px;
-    border-color: ta.has-hover ? root.c-line : #00000000;
-    background: ta.has-hover ? root.c-surface : #00000000;
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => root.clicked();
-    }
-    t := Text {
-        x: 0;
-        width: parent.width;
-        height: parent.height;
-        text: root.label;
-        font-size: 12px;
-        color: root.accent || root.on || ta.has-hover
-            ? root.c-text-hi : root.c-text-dim;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-    min-width: t.preferred-width + 16px;
 }
