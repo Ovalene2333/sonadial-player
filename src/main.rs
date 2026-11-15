@@ -3,11 +3,11 @@
     windows_subsystem = "windows"
 )]
 
-mod app;
 mod audio;
 mod auto_theme;
 mod beat;
 mod beat_config;
+mod cache_store;
 mod decode;
 mod design;
 mod download;
@@ -15,40 +15,34 @@ mod eq;
 mod lyrics;
 mod notes;
 mod pitch;
+mod search;
 mod song_type;
 mod sound_profile;
 mod spectrum;
 mod storage;
 mod theme;
 mod theme_library;
-mod viz;
+mod ui;
 
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use eframe::egui::ViewportBuilder;
-
-fn main() -> eframe::Result {
+fn main() {
     install_panic_log();
 
-    let initial = std::env::args().nth(1).map(PathBuf::from);
-    let options = eframe::NativeOptions {
-        viewport: ViewportBuilder::default()
-            .with_inner_size([1180.0, 760.0])
-            .with_min_inner_size([880.0, 560.0])
-            .with_decorations(false)
-            .with_resizable(true)
-            .with_title("Sonadial Player"),
-        renderer: eframe::Renderer::Glow,
-        ..Default::default()
-    };
+    // Software rendering is the default on this branch (the whole point: the
+    // GPU driver stack is ~100 MB of the old build's footprint). `--gpu`
+    // switches to Slint's femtovg renderer for comparison.
+    if !std::env::args().any(|arg| arg == "--gpu") {
+        std::env::set_var("SLINT_BACKEND", "winit-software");
+    }
 
-    eframe::run_native(
-        "Sonadial Player",
-        options,
-        Box::new(move |cc| Ok(Box::new(app::SonadialApp::new(cc, initial.clone())))),
-    )
+    let initial = std::env::args()
+        .nth(1)
+        .filter(|arg| !arg.starts_with("--"))
+        .map(PathBuf::from);
+    ui::run(initial);
 }
 
 fn install_panic_log() {

@@ -684,8 +684,8 @@ pub fn paint_core(
         paint_core_classic(painter, center, visual, playing, pulse_enabled, base_disc_r);
     }
 
-    let time_size = (base_disc_r * 0.22).clamp(9.0, 17.0);
-    let status_size = (base_disc_r * 0.17).clamp(10.0, 16.0);
+    let time_size = (base_disc_r * 0.22).clamp(9.0, 17.0).round();
+    let status_size = (base_disc_r * 0.17).clamp(10.0, 16.0).round();
 
     painter.text(
         Pos2::new(center.x, center.y - base_disc_r * 0.04),

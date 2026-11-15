@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ use rustfft::num_complex::Complex;
 use rustfft::{Fft, FftPlanner};
 use serde::{Deserialize, Serialize};
 
+use crate::cache_store;
 use crate::pitch::{self, MAX_MIDI, MIN_MIDI, NUM_NOTES};
 use crate::storage;
 
@@ -51,6 +52,9 @@ const LOW_START_OFFSET: f64 = 0.28;
 
 const MIN_NOTE_SECS: f64 = 0.18;
 const MAX_NOTE_SECS: f64 = 10.0;
+/// Lowest MIDI note the onset splitter can inspect; the raw matrix starts here
+/// because lower rows would never be read.
+const RAW_MIN_MIDI: u8 = 48;
 /// Frames a note may vanish before it is considered released.
 const GAP_FRAMES: u32 = 2;
 const MIN_NOTE_LEVEL: f32 = 0.14;
@@ -436,7 +440,10 @@ fn analyze_pcm(samples: &[f32], cancel: &AtomicBool) -> Result<NoteAnalysis> {
     let mut low_detections = Vec::new();
     let mut seen = [false; NUM_NOTES];
     let mut flux = vec![0.0_f32; frame_count];
-    let mut raw = vec![0.0_f32; NUM_NOTES * frame_count];
+    // Only notes at or above `RAW_MIN_MIDI` are ever read back (the low band
+    // skips onset splitting), so the matrix starts at the first high row.
+    let low_rows = (RAW_MIN_MIDI - MIN_MIDI) as usize;
+    let mut raw = vec![0.0_f32; (NUM_NOTES - low_rows) * frame_count];
     let mut previous_mag = vec![0.0_f32; high.num_bins];
 
     for frame in 0..frame_count {
@@ -467,7 +474,9 @@ fn analyze_pcm(samples: &[f32], cancel: &AtomicBool) -> Result<NoteAnalysis> {
         seen.fill(false);
         for &(index, level, absolute, attack) in &detections {
             seen[index] = true;
-            raw[index * frame_count + frame] = attack;
+            if index >= low_rows {
+                raw[(index - low_rows) * frame_count + frame] = attack;
+            }
             if let Some(state) = &mut states[index] {
                 state.last_frame = frame;
                 state.gap = 0;
@@ -564,11 +573,11 @@ fn split_onsets(notes: &mut Vec<NoteEvent>, flux: &[f32], raw: &[f32], frame_cou
     }
     let mut result = Vec::with_capacity(notes.len());
     for note in notes.drain(..) {
-        if note.midi < 48 {
+        if note.midi < RAW_MIN_MIDI {
             result.push(note);
             continue;
         }
-        let base = (note.midi - MIN_MIDI) as usize * frame_count;
+        let base = (note.midi - RAW_MIN_MIDI) as usize * frame_count;
         let mut cuts: Vec<f64> = Vec::new();
         for (position, &frame) in onsets.iter().enumerate() {
             let moment = frame_time(frame);
@@ -735,11 +744,13 @@ pub fn analyze_file(path: &Path, cancel: &AtomicBool) -> Result<NoteAnalysis> {
         });
     }
 
-    let samples = crate::decode::decode_mono(path, SAMPLE_RATE, cancel)?;
+    let samples = crate::decode::decode_mono_shared(path, SAMPLE_RATE, cancel)?;
     if cancel.load(Ordering::Relaxed) {
         return Err(anyhow!("note analysis cancelled"));
     }
     let analysis = analyze_pcm(&samples, cancel)?;
+    // Free the decoded track before the cache rewrite allocates its own copy.
+    drop(samples);
     if let Some(signature) = signature {
         store_cache_entry(path, signature, &analysis);
     }
@@ -766,6 +777,8 @@ fn file_signature(path: &Path) -> Option<FileSignature> {
     })
 }
 
+/// Legacy single-file cache layout; only parsed once during migration, never
+/// written anymore.
 #[derive(Serialize, Deserialize, Default)]
 struct NotesCacheFile {
     #[serde(default)]
@@ -791,9 +804,8 @@ struct NotesCacheEntry {
 
 static CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-fn cache_path() -> PathBuf {
-    storage::data_dir().join("notes_cache.json")
-}
+/// Analysis cache kind: one JSON file per track under `analysis/notes`.
+const CACHE_KIND: &str = "notes";
 
 fn cache_lock() -> &'static Mutex<()> {
     CACHE_LOCK.get_or_init(|| Mutex::new(()))
@@ -806,40 +818,32 @@ fn cache_key(path: &Path) -> String {
         .to_string()
 }
 
-fn read_cache() -> NotesCacheFile {
-    fs::read_to_string(cache_path())
-        .ok()
-        .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok())
-        .unwrap_or_default()
-}
-
-fn write_cache(cache: &NotesCacheFile) {
-    let path = cache_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let Ok(data) = serde_json::to_vec(cache) else {
+/// One-time split of the legacy single-file cache: each track goes into its
+/// own file, then the big file is dropped. Unreadable or outdated caches are
+/// simply removed — those entries re-analyze on demand.
+fn migrate_legacy_cache() {
+    let legacy = storage::data_dir().join("notes_cache.json");
+    let Some(cache) = cache_store::read_json_file::<NotesCacheFile>(&legacy) else {
         return;
     };
-    let temp = path.with_extension("json.tmp");
-    if fs::write(&temp, data).is_ok() {
-        let _ = fs::remove_file(&path);
-        let _ = fs::rename(&temp, &path);
+    if cache.version == ANALYSIS_VERSION {
+        for (key, entry) in &cache.tracks {
+            cache_store::write_entry(CACHE_KIND, key, entry);
+        }
     }
+    let _ = fs::remove_file(&legacy);
 }
 
 fn load_cache_entry(path: &Path, signature: FileSignature) -> Option<NotesCacheEntry> {
     let _guard = cache_lock().lock().ok()?;
-    let cache = read_cache();
-    if cache.version != ANALYSIS_VERSION {
-        return None;
-    }
-    let entry = cache.tracks.get(&cache_key(path))?;
+    migrate_legacy_cache();
+    let key = cache_key(path);
+    let entry: NotesCacheEntry = cache_store::read_entry(CACHE_KIND, &key)?;
     if entry.version == ANALYSIS_VERSION
         && entry.size == signature.size
         && entry.mtime_ms == signature.mtime_ms
     {
-        Some(entry.clone())
+        Some(entry)
     } else {
         None
     }
@@ -849,43 +853,20 @@ fn store_cache_entry(path: &Path, signature: FileSignature, analysis: &NoteAnaly
     let Ok(_guard) = cache_lock().lock() else {
         return;
     };
-    let mut cache = read_cache();
-    if cache.version != ANALYSIS_VERSION {
-        cache.tracks.clear();
-    }
-    cache.version = ANALYSIS_VERSION;
+    migrate_legacy_cache();
     let saved_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    cache.tracks.insert(
-        cache_key(path),
-        NotesCacheEntry {
-            version: ANALYSIS_VERSION,
-            size: signature.size,
-            mtime_ms: signature.mtime_ms,
-            saved_at,
-            notes: analysis.notes.clone(),
-            key: analysis.key.clone(),
-            avg_confidence: analysis.avg_confidence,
-        },
-    );
-    prune_cache(&mut cache);
-    write_cache(&cache);
-}
-
-fn prune_cache(cache: &mut NotesCacheFile) {
-    if cache.tracks.len() <= 64 {
-        return;
-    }
-    let mut entries = cache
-        .tracks
-        .iter()
-        .map(|(key, entry)| (key.clone(), entry.saved_at))
-        .collect::<Vec<(String, u64)>>();
-    entries.sort_by_key(|(_, saved_at)| *saved_at);
-    let remove = cache.tracks.len() - 48;
-    for (key, _) in entries.into_iter().take(remove) {
-        cache.tracks.remove(&key);
-    }
+    let entry = NotesCacheEntry {
+        version: ANALYSIS_VERSION,
+        size: signature.size,
+        mtime_ms: signature.mtime_ms,
+        saved_at,
+        notes: analysis.notes.clone(),
+        key: analysis.key.clone(),
+        avg_confidence: analysis.avg_confidence,
+    };
+    cache_store::write_entry(CACHE_KIND, &cache_key(path), &entry);
+    cache_store::prune_entries(CACHE_KIND, 64, 48);
 }

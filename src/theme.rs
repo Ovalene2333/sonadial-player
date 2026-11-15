@@ -1,11 +1,4 @@
-use std::sync::{Arc, PoisonError, RwLock};
-
-use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, FontTweak, Stroke, TextStyle,
-    Visuals,
-};
-
-use crate::design as tokens;
+use std::sync::{PoisonError, RwLock};
 
 pub type Rgb = [u8; 3];
 
@@ -428,12 +421,12 @@ pub struct Look {
 }
 
 impl Look {
-    pub fn text_hi(&self) -> Color32 {
-        color(self.palette.text_hi)
+    pub fn text_hi(&self) -> Rgb {
+        self.palette.text_hi
     }
 
-    pub fn text_dim(&self) -> Color32 {
-        color(self.palette.text_dim)
+    pub fn text_dim(&self) -> Rgb {
+        self.palette.text_dim
     }
 
     /// Straight RGB blend for cross-fades; `dark` flips at the midpoint.
@@ -627,292 +620,51 @@ fn palette() -> Palette {
     current_look().palette
 }
 
-fn color(rgb: Rgb) -> Color32 {
-    Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+pub fn bg() -> Rgb {
+    palette().bg
 }
 
-pub fn paint_background(painter: &egui::Painter, rect: egui::Rect) {
-    paint_look(painter, rect, &current_look());
+pub fn bg_deep() -> Rgb {
+    palette().bg_deep
 }
 
-pub fn paint_look(painter: &egui::Painter, rect: egui::Rect, look: &Look) {
-    match look.gradient {
-        Some(corners) => paint_gradient(painter, rect, corners),
-        None => {
-            painter.rect_filled(rect, tokens::RADIUS, color(look.palette.bg));
-        }
-    }
+pub fn surface() -> Rgb {
+    palette().surface
 }
 
-fn paint_gradient(painter: &egui::Painter, rect: egui::Rect, corners: [[u8; 3]; 4]) {
-    // Bilinear blend over a small grid: two triangles alone would crease along
-    // the diagonal once the four corners carry different hues.
-    const COLS: u32 = 16;
-    const ROWS: u32 = 10;
-    let [tl, tr, br, bl] = corners;
-    let mut mesh = egui::Mesh::default();
-    for row in 0..=ROWS {
-        let v = row as f32 / ROWS as f32;
-        for col in 0..=COLS {
-            let u = col as f32 / COLS as f32;
-            let channel = |i: usize| {
-                let top = tl[i] as f32 + (tr[i] as f32 - tl[i] as f32) * u;
-                let bottom = bl[i] as f32 + (br[i] as f32 - bl[i] as f32) * u;
-                (top + (bottom - top) * v).round() as u8
-            };
-            mesh.colored_vertex(
-                egui::pos2(
-                    rect.left() + rect.width() * u,
-                    rect.top() + rect.height() * v,
-                ),
-                Color32::from_rgb(channel(0), channel(1), channel(2)),
-            );
-        }
-    }
-    for row in 0..ROWS {
-        for col in 0..COLS {
-            let top_left = row * (COLS + 1) + col;
-            let bottom_left = top_left + COLS + 1;
-            mesh.add_triangle(top_left, top_left + 1, bottom_left + 1);
-            mesh.add_triangle(top_left, bottom_left + 1, bottom_left);
-        }
-    }
-    painter.add(egui::Shape::mesh(mesh));
+pub fn surface_hi() -> Rgb {
+    palette().surface_hi
 }
 
-pub fn bg() -> Color32 {
-    color(palette().bg)
+pub fn surface_sunken() -> Rgb {
+    palette().surface_sunken
 }
 
-pub fn bg_deep() -> Color32 {
-    color(palette().bg_deep)
+pub fn text_hi() -> Rgb {
+    palette().text_hi
 }
 
-pub fn surface() -> Color32 {
-    color(palette().surface)
+pub fn text() -> Rgb {
+    palette().text
 }
 
-pub fn surface_hi() -> Color32 {
-    color(palette().surface_hi)
+pub fn text_dim() -> Rgb {
+    palette().text_dim
 }
 
-pub fn surface_sunken() -> Color32 {
-    color(palette().surface_sunken)
+pub fn line() -> Rgb {
+    palette().line
 }
 
-pub fn text_hi() -> Color32 {
-    color(palette().text_hi)
+pub fn danger() -> Rgb {
+    palette().danger
 }
 
-pub fn text() -> Color32 {
-    color(palette().text)
-}
-
-pub fn text_dim() -> Color32 {
-    color(palette().text_dim)
-}
-
-pub fn line() -> Color32 {
-    color(palette().line)
-}
-
-pub fn danger() -> Color32 {
-    color(palette().danger)
-}
-
-pub fn ink(value: u8) -> Color32 {
+/// The greyscale instrument ink: a grey value pulled toward the palette's
+/// ink tint, matching the egui build's `ink()` behaviour.
+pub fn ink(value: u8) -> Rgb {
     let palette = palette();
     let value = if palette.dark { value } else { 255 - value };
-    let gray = Color32::from_gray(value);
-    mix(gray, color(palette.ink_tint), palette.ink_mix)
-}
-
-pub fn alpha(color: Color32, a: u8) -> Color32 {
-    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), a)
-}
-
-pub fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
-    let t = t.clamp(0.0, 1.0);
-    let lerp = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
-    Color32::from_rgba_unmultiplied(
-        lerp(a.r(), b.r()),
-        lerp(a.g(), b.g()),
-        lerp(a.b(), b.b()),
-        lerp(a.a(), b.a()),
-    )
-}
-
-pub fn install(ctx: &egui::Context) {
-    install_fonts(ctx);
-    apply(ctx);
-}
-
-pub fn apply(ctx: &egui::Context) {
-    let dark = palette().dark;
-    ctx.set_theme(if dark {
-        egui::Theme::Dark
-    } else {
-        egui::Theme::Light
-    });
-
-    ctx.tessellation_options_mut(|options| {
-        options.feathering = true;
-        options.feathering_size_in_pixels = 1.0;
-        options.round_line_segments_to_pixels = true;
-    });
-
-    let mut visuals = if dark {
-        Visuals::dark()
-    } else {
-        Visuals::light()
-    };
-    visuals.panel_fill = Color32::TRANSPARENT;
-    visuals.window_fill = bg();
-    visuals.extreme_bg_color = bg();
-    visuals.faint_bg_color = surface_hi();
-    visuals.selection.bg_fill = text_hi();
-    visuals.selection.stroke = Stroke::new(1.0, bg());
-    visuals.hyperlink_color = text_hi();
-    visuals.text_cursor.stroke = Stroke::new(6.0, text_hi());
-    visuals.widgets.noninteractive.bg_fill = bg();
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, line());
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, text());
-    visuals.widgets.inactive.bg_fill = Color32::TRANSPARENT;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, line());
-    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, text());
-    visuals.widgets.hovered.bg_fill = text_hi();
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, text_hi());
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, bg());
-    visuals.widgets.active.bg_fill = text_hi();
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, text_hi());
-    visuals.widgets.active.fg_stroke = Stroke::new(1.0, bg());
-    // Square widgets everywhere: egui's default rounded scrollbar handle
-    // reads as a modern overlay and breaks the terminal look.
-    for widget in [
-        &mut visuals.widgets.noninteractive,
-        &mut visuals.widgets.inactive,
-        &mut visuals.widgets.hovered,
-        &mut visuals.widgets.active,
-        &mut visuals.widgets.open,
-    ] {
-        widget.corner_radius = tokens::RADIUS.into();
-    }
-    visuals.window_shadow = egui::epaint::Shadow {
-        offset: [0, 0],
-        blur: 0,
-        spread: 0,
-        color: Color32::TRANSPARENT,
-    };
-    visuals.popup_shadow = visuals.window_shadow;
-    visuals.window_corner_radius = tokens::RADIUS.into();
-    visuals.menu_corner_radius = tokens::RADIUS.into();
-
-    ctx.all_styles_mut(|style| {
-        style.text_styles = std::collections::BTreeMap::from([
-            (TextStyle::Heading, FontId::new(20.0, FontFamily::Monospace)),
-            (TextStyle::Body, FontId::new(14.0, FontFamily::Monospace)),
-            (TextStyle::Button, FontId::new(13.0, FontFamily::Monospace)),
-            (TextStyle::Small, FontId::new(12.0, FontFamily::Monospace)),
-            (
-                TextStyle::Monospace,
-                FontId::new(13.0, FontFamily::Monospace),
-            ),
-        ]);
-        style.spacing.item_spacing = egui::vec2(tokens::SPACE_TIGHT, tokens::SPACE_1);
-        style.spacing.button_padding = egui::vec2(tokens::SPACE_TIGHT, tokens::HAIRLINE);
-        style.spacing.interact_size.y = tokens::CONTROL_H;
-        style.spacing.scroll = egui::style::ScrollStyle::solid();
-        style.spacing.scroll.bar_width = tokens::SPACE_TIGHT;
-        style.spacing.scroll.bar_inner_margin = tokens::HAIRLINE;
-        style.spacing.scroll.bar_outer_margin = tokens::SPACE_1;
-        style.visuals = visuals.clone();
-    });
-}
-
-fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = FontDefinitions::default();
-    // Hack and Ubuntu are unused: the embedded faces cover every glyph this
-    // UI draws. Dropping them keeps only the typefaces the design needs.
-    fonts.font_data.remove("Hack");
-    fonts.font_data.remove("Ubuntu-Light");
-
-    // Sarasa Mono SC supplies the narrower TUI/Latin face. Only Latin,
-    // punctuation, symbol and Braille ranges are embedded; CJK lives in the
-    // Fusion pixel faces below.
-    let sarasa = include_bytes!("../assets/fonts/SarasaMonoSC-TUI.ttf");
-    fonts
-        .font_data
-        .insert("tui".to_owned(), Arc::new(FontData::from_static(sarasa)));
-
-    // Dot-matrix Latin/narrow glyphs for the lyric readout. The main UI keeps
-    // Sarasa's TUI face; this one is reserved for lyrics and their brackets.
-    let lyric_tui = include_bytes!("../assets/fonts/FusionPixel12-Mono-TUI.ttf");
-    fonts.font_data.insert(
-        "lyric-tui".to_owned(),
-        Arc::new(FontData::from_static(lyric_tui)),
-    );
-
-    // epaint positions each fallback run from its own ascent. Fusion's CJK
-    // box already extends below the Latin baseline, so a small upward optical
-    // correction keeps Chinese from sitting low in mixed lines.
-    let fusion_tweak = FontTweak {
-        y_offset_factor: -0.16,
-        ..Default::default()
-    };
-
-    // Fusion Pixel 12px handles CJK.
-    let compact = include_bytes!("../assets/fonts/FusionPixel12-Mono-CJK.ttf");
-    fonts.font_data.insert(
-        "ui".to_owned(),
-        Arc::new(FontData::from_static(compact).tweak(fusion_tweak.clone())),
-    );
-
-    // Japanese and Korean live in separate pixel subsets: the Chinese face
-    // above only carries simplified forms and has no kana or hangul.
-    let japanese = include_bytes!("../assets/fonts/FusionPixel12-Mono-JA.ttf");
-    fonts.font_data.insert(
-        "ja".to_owned(),
-        Arc::new(FontData::from_static(japanese).tweak(fusion_tweak.clone())),
-    );
-    let korean = include_bytes!("../assets/fonts/FusionPixel12-Mono-KO.ttf");
-    fonts.font_data.insert(
-        "ko".to_owned(),
-        Arc::new(FontData::from_static(korean).tweak(fusion_tweak)),
-    );
-
-    // Fusion first so CJK punctuation stays pixel-shaped; Sarasa supplies the
-    // narrow Latin face and Braille when Fusion has no glyph.
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        fonts.families.insert(
-            family,
-            vec![
-                "ui".to_owned(),
-                "ja".to_owned(),
-                "ko".to_owned(),
-                "tui".to_owned(),
-                "egui-icons".to_owned(),
-            ],
-        );
-    }
-    fonts.families.insert(
-        FontFamily::Name("ui".into()),
-        vec![
-            "ui".to_owned(),
-            "ja".to_owned(),
-            "ko".to_owned(),
-            "tui".to_owned(),
-        ],
-    );
-    fonts.families.insert(
-        FontFamily::Name("lyric".into()),
-        vec![
-            "lyric-tui".to_owned(),
-            "ui".to_owned(),
-            "ja".to_owned(),
-            "ko".to_owned(),
-            "tui".to_owned(),
-        ],
-    );
-
-    ctx.set_fonts(fonts);
+    let gray = [value; 3];
+    mix_rgb(gray, palette.ink_tint, palette.ink_mix)
 }

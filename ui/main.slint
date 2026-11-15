@@ -1,0 +1,373 @@
+// Sonadial Player — Slint software-rendered UI (slint-ui branch).
+// Geometry mirrors src/viz.rs: usable/258 scale, inner_r = 120*scale,
+// max_amp = 100*scale, 100 radial bars in greyscale instrument ink.
+
+export struct BarData {
+    len: float,
+    peak: float,
+    ang: float,
+    col: color,
+}
+
+export component Main inherits Window {
+    width: 1180px;
+    height: 760px;
+    min-width: 880px;
+    min-height: 560px;
+    title: "Sonadial Player";
+    default-font-family: "Sarasa Mono SC";
+    background: transparent;
+
+    // ---------- data ----------
+    in-out property <[BarData]> bars;
+    in-out property <float> ring-rotation; // degrees, animated while playing
+    in-out property <float> radial-scale: 1.0;
+    in-out property <bool> show-bg-spectrum: true;
+    in-out property <bool> show-radial: true;
+    in-out property <bool> show-peaks: true;
+    in-out property <float> pulse: 0;   // 0..1 expanding beat ring intensity
+    in-out property <float> beat-age: 1; // 0..1 since last launched ring
+    in-out property <float> kick: 0;   // 0..1 live low-band energy
+
+    // ---------- colors (set from the Rust theme layer) ----------
+    in-out property <color> bg-top;
+    in-out property <color> bg-bottom;
+    in-out property <color> corner-tl;
+    in-out property <color> corner-br;
+    in-out property <color> c-bg-deep;
+    in-out property <color> c-surface;
+    in-out property <color> c-line;
+    in-out property <color> c-text-hi;
+    in-out property <color> c-text;
+    in-out property <color> c-text-dim;
+    in-out property <color> c-ring;
+    in-out property <color> c-ring-hi;
+
+    // ---------- readout ----------
+    in-out property <string> time-text: "0:00 / 0:00";
+    in-out property <string> status-text: "[STANDBY]";
+    in-out property <string> track-title: "";
+    in-out property <string> theme-label: "MONO";
+    in-out property <string> mode-label: "SEQ";
+    in-out property <string> lyric-current: "";
+    in-out property <string> lyric-next: "";
+    in-out property <bool> lyric-active: false;
+    in-out property <float> progress: 0;
+    in-out property <bool> paused: true;
+    in-out property <bool> has-track: false;
+    in-out property <float> volume: 0.78;
+
+    // ---------- geometry (viz.rs mirror) ----------
+    property <length> usable: min(width, height) / 2 - 8px;
+    property <float> scale: clamp(usable / 1px / 258.0, 0.45, 2.4)
+        * clamp(root.radial-scale, 0.7, 1.2);
+    property <length> inner-r: min(120px * scale, usable * 0.75);
+    property <length> max-amp: min(100px * scale, usable - inner-r - 2px);
+    property <length> bar-w: max(2.8px * scale, 1px);
+    property <length> peak-w: max(bar-w * 0.9, 1.5px);
+    property <length> disc-r: inner-r * 0.669;
+
+    callback toggle-play();
+    callback next-track();
+    callback prev-track();
+    callback seek-to(float);
+    callback set-volume(float);
+    callback cycle-mode();
+    callback add-files();
+    callback next-theme();
+    callback toggle-auto-theme();
+
+    // ============ background: 4-corner gradient approximation ============
+    Rectangle {
+        background: @linear-gradient(180deg, root.bg-top, root.bg-bottom);
+    }
+    Rectangle {
+        background: @linear-gradient(90deg, root.corner-tl 0%, #00000000 42%,
+            #00000000 58%, root.corner-br 100%);
+    }
+
+    // ============ bottom spectrum field ============
+    Rectangle {
+        visible: root.show-bg-spectrum;
+        y: parent.height * 0.62;
+        height: parent.height * 0.30;
+        width: parent.width;
+        clip: true;
+        for bar[i] in root.bars: Rectangle {
+            x: i * (parent.width / 100);
+            width: parent.width / 100 - 1px;
+            height: max(2px, bar.len * parent.height);
+            y: parent.height - self.height;
+            background: bar.col;
+            opacity: 0.5;
+        }
+    }
+
+    // ============ radial spectrum ring ============
+    // Baseline circle stroke.
+    Rectangle {
+        visible: root.show-radial;
+        x: root.width / 2 - root.inner-r;
+        y: root.height / 2 - root.inner-r;
+        width: root.inner-r * 2;
+        height: root.inner-r * 2;
+        border-radius: root.inner-r;
+        border-width: max(1.5px * root.scale, 1px);
+        border-color: root.c-ring;
+    }
+    // Expanding beat ring.
+    Rectangle {
+        visible: root.show-radial && root.pulse > 0.02;
+        opacity: root.pulse;
+        x: root.width / 2 - r.r;
+        y: root.height / 2 - r.r;
+        width: r.r * 2;
+        height: r.r * 2;
+        border-radius: r.r;
+        border-width: max(1px, root.pulse * 3px * root.scale);
+        border-color: root.c-ring-hi;
+        property <length> r: root.inner-r * (1.05 + root.beat-age * 0.45);
+    }
+    // 100 radial bars, rotated around the window center.
+    for bar[i] in root.bars: Rectangle {
+        visible: root.show-radial && bar.len > 0.005;
+        width: root.bar-w;
+        height: max(2px, bar.len * root.max-amp);
+        x: root.width / 2 - self.width / 2;
+        y: root.height / 2 - root.inner-r - self.height;
+        rotation-angle: bar.ang * 1deg + root.ring-rotation * 1deg;
+        rotation-origin-x: self.width / 2;
+        rotation-origin-y: self.height + root.inner-r;
+        background: bar.col;
+        border-radius: self.width / 2;
+    }
+    // Peak markers.
+    for bar[i] in root.bars: Rectangle {
+        visible: root.show-radial && root.show-peaks
+            && bar.peak > bar.len + 0.012;
+        width: root.peak-w;
+        height: root.peak-w;
+        x: root.width / 2 - self.width / 2;
+        y: root.height / 2 - root.inner-r - bar.peak * root.max-amp
+            - self.height / 2 - 2px;
+        rotation-angle: bar.ang * 1deg + root.ring-rotation * 1deg;
+        rotation-origin-x: self.width / 2;
+        rotation-origin-y: self.height / 2 + root.inner-r
+            + bar.peak * root.max-amp + 2px;
+        background: bar.col;
+        border-radius: self.width / 2;
+    }
+
+    // ============ core dial ============
+    Rectangle {
+        x: root.width / 2 - root.disc-r * (1 + root.kick * 0.04);
+        y: root.height / 2 - root.disc-r * (1 + root.kick * 0.04);
+        width: root.disc-r * 2 * (1 + root.kick * 0.04);
+        height: root.disc-r * 2 * (1 + root.kick * 0.04);
+        border-radius: root.disc-r * (1 + root.kick * 0.04);
+        background: root.c-bg-deep;
+        border-width: 1px;
+        border-color: root.c-line;
+    }
+    Text {
+        text: root.time-text;
+        x: 0;
+        y: root.height / 2 - root.disc-r * 0.2;
+        width: root.width;
+        horizontal-alignment: center;
+        font-size: max(9px, root.disc-r * 0.20);
+        color: root.c-text-hi;
+    }
+    Text {
+        text: root.status-text;
+        x: 0;
+        y: root.height / 2 + root.disc-r * 0.22;
+        width: root.width;
+        horizontal-alignment: center;
+        font-size: max(10px, root.disc-r * 0.15);
+        color: root.c-text-dim;
+    }
+
+    // ============ header ============
+    Text {
+        x: 18px;
+        y: 12px;
+        text: "SONADIAL";
+        font-size: 12px;
+        color: root.c-text-dim;
+    }
+    Text {
+        x: parent.width - self.width - 18px;
+        y: 12px;
+        text: root.theme-label;
+        font-size: 12px;
+        color: root.c-text-dim;
+    }
+
+    // ============ lyrics (typewriter, top-left) ============
+    Text {
+        visible: root.has-track;
+        x: 18px;
+        y: 40px;
+        text: ">";
+        font-size: 16px;
+        color: root.lyric-active ? root.c-text : root.c-text-dim;
+    }
+    Rectangle {
+        visible: root.has-track;
+        x: 40px;
+        y: 40px;
+        height: 20px;
+        width: parent.width - 58px;
+        clip: true;
+        Text {
+            y: (parent.height - self.height) / 2;
+            text: root.lyric-current;
+            font-size: 16px;
+            font-family: "Fusion Pixel 12px Mono latin";
+            color: root.lyric-active ? root.c-text-hi : root.c-text-dim;
+        }
+    }
+    Text {
+        visible: root.has-track;
+        x: 40px;
+        y: 68px;
+        width: parent.width - 58px;
+        text: root.lyric-next;
+        font-size: 12px;
+        font-family: "Fusion Pixel 12px Mono latin";
+        color: root.c-text-dim;
+        overflow: elide;
+    }
+
+    // ============ bottom bar ============
+    Rectangle {
+        y: parent.height - 48px;
+        width: parent.width;
+        height: 48px;
+        // progress strip
+        Rectangle {
+            y: 0;
+            height: 2px;
+            width: parent.width;
+            background: root.c-line;
+            opacity: 0.55;
+        }
+        Rectangle {
+            y: 0;
+            height: 2px;
+            width: root.progress * parent.width;
+            background: root.c-text-hi;
+        }
+        TouchArea {
+            y: -6px;
+            height: 14px;
+            width: parent.width;
+            mouse-cursor: pointer;
+            clicked => {
+                if (parent.width > 0px) {
+                    root.seek-to(self.mouse-x / parent.width);
+                }
+            }
+        }
+        HorizontalLayout {
+            y: 12px;
+            height: 26px;
+            padding-left: 14px;
+            padding-right: 14px;
+            spacing: 10px;
+            Btn {
+                label: "ADD";
+                clicked => root.add-files();
+            }
+            Btn {
+                label: root.mode-label;
+                on: true;
+                clicked => root.cycle-mode();
+            }
+            Btn {
+                label: "THEME";
+                clicked => root.next-theme();
+            }
+            Btn {
+                label: "AUTO";
+                clicked => root.toggle-auto-theme();
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Btn {
+                label: "<<";
+                clicked => root.prev-track();
+            }
+            Btn {
+                label: root.paused ? "PLAY" : "PAUSE";
+                accent: true;
+                clicked => root.toggle-play();
+            }
+            Btn {
+                label: ">>";
+                clicked => root.next-track();
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: root.time-text;
+                font-size: 12px;
+                color: root.c-text-dim;
+                vertical-alignment: center;
+            }
+            // volume strip
+            Rectangle {
+                width: 130px;
+                Rectangle {
+                    y: 12px;
+                    height: 2px;
+                    width: parent.width;
+                    background: root.c-line;
+                    opacity: 0.6;
+                }
+                Rectangle {
+                    y: 12px;
+                    height: 2px;
+                    width: root.volume * parent.width;
+                    background: root.c-text-hi;
+                }
+                TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => {
+                        if (parent.width > 0px) {
+                            root.set-volume(self.mouse-x / parent.width);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Terminal-style text button.
+component Btn inherits Rectangle {
+    in property <string> label;
+    in property <bool> accent: false;
+    in property <bool> on: false;
+    callback clicked();
+    height: 22px;
+    border-width: 1px;
+    border-radius: 3px;
+    border-color: ta.has-hover ? root.c-line : #00000000;
+    background: ta.has-hover ? root.c-surface : #00000000;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    t := Text {
+        x: 0;
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        font-size: 12px;
+        color: root.accent || root.on || ta.has-hover
+            ? root.c-text-hi : root.c-text-dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    min-width: t.preferred-width + 16px;
+}

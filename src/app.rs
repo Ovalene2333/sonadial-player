@@ -45,6 +45,7 @@ struct TrackEntry {
     path: PathBuf,
     title: String,
     lrc: Option<PathBuf>,
+    search_index: crate::search::SearchIndex,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,6 +69,24 @@ impl PlayMode {
             Self::Sequence => "SEQ",
             Self::RepeatOne => "ONE",
             Self::Shuffle => "SHUF",
+        }
+    }
+
+    /// Persisted as a small integer so `storage` does not need to know the
+    /// enum. The order is stable: 0 sequence, 1 repeat one, 2 shuffle.
+    fn from_saved(value: u8) -> Self {
+        match value {
+            1 => Self::RepeatOne,
+            2 => Self::Shuffle,
+            _ => Self::Sequence,
+        }
+    }
+
+    fn saved(self) -> u8 {
+        match self {
+            Self::Sequence => 0,
+            Self::RepeatOne => 1,
+            Self::Shuffle => 2,
         }
     }
 
@@ -223,6 +242,8 @@ pub struct SonadialApp {
     note_generation: u64,
     offline_notes: Option<NoteAnalysis>,
     notes_state: NotesState,
+    /// Track the cached `offline_notes` belong to.
+    notes_path: Option<PathBuf>,
     offline_beats: Vec<(f64, f32)>,
     offline_index: usize,
     offline_seq: u64,
@@ -248,8 +269,6 @@ pub struct SonadialApp {
     playing: bool,
     paused: bool,
     volume: f32,
-    default_volume: f32,
-    track_volumes: HashMap<String, f32>,
     search: String,
     /// Custom track-list scrollbar: pending offset for the next frame and the
     /// pointer's grab offset inside the thumb.
@@ -295,6 +314,10 @@ pub struct SonadialApp {
     download_progress: f32,
     download_status: String,
     download_running: bool,
+    /// Proxy for the downloader, empty for a direct connection.
+    proxy: String,
+    /// Proxy found in the environment at startup, offered as a one-click fill.
+    env_proxy: Option<String>,
     error: Option<String>,
     seek_preview: Option<f32>,
     play_mode: PlayMode,
@@ -353,22 +376,14 @@ impl SonadialApp {
                 .position(|t| t.path.to_string_lossy() == *path)
         });
 
-        let default_volume = state.volume.clamp(0.0, 1.25);
-        let track_volumes: HashMap<String, f32> = state
-            .track_volumes
-            .iter()
-            .filter_map(|(path, volume)| {
-                volume
-                    .is_finite()
-                    .then(|| (path.clone(), volume.clamp(0.0, 1.25)))
-            })
-            .collect();
-        let volume = current
-            .and_then(|index| playlist.get(index))
-            .and_then(|track| track_volumes.get(&track.path.to_string_lossy().to_string()))
-            .copied()
-            .unwrap_or(default_volume)
-            .clamp(0.0, 1.25);
+        // Volume is one global level. Older builds stored a separate level per
+        // track; that made the slider look like it had forgotten the change as
+        // soon as another track started, so it is no longer read.
+        let volume = if state.volume.is_finite() {
+            state.volume.clamp(0.0, 1.25)
+        } else {
+            0.78
+        };
         let mut eq_gains = [0.0_f32; NUM_BANDS];
         for (index, gain) in state.eq_gains.iter().take(NUM_BANDS).enumerate() {
             eq_gains[index] = if gain.is_finite() {
@@ -401,6 +416,7 @@ impl SonadialApp {
             note_generation: 0,
             offline_notes: None,
             notes_state: NotesState::Idle,
+            notes_path: None,
             offline_beats: Vec::new(),
             offline_index: 0,
             offline_seq: 0,
@@ -428,8 +444,7 @@ impl SonadialApp {
             playing: false,
             paused: false,
             volume,
-            default_volume,
-            track_volumes,
+            play_mode: PlayMode::from_saved(state.play_mode),
             search: String::new(),
             track_scroll_target: None,
             track_scroll_grab: None,
@@ -469,9 +484,10 @@ impl SonadialApp {
             download_progress: 0.0,
             download_status: String::new(),
             download_running: false,
+            proxy: state.proxy.clone(),
+            env_proxy: env_proxy(),
             error: theme_error,
             seek_preview: None,
-            play_mode: PlayMode::Sequence,
             last_tick: Instant::now(),
             dirty: false,
             save_at: Instant::now(),
@@ -616,7 +632,7 @@ impl SonadialApp {
             self.playing = false;
             self.paused = false;
             if !self.playlist.is_empty() {
-                self.next_track();
+                self.advance_track(true);
             }
         }
 
@@ -750,6 +766,7 @@ impl SonadialApp {
                 Action::Volume(value) => self.set_volume(value),
                 Action::CycleMode => {
                     self.play_mode = self.play_mode.next();
+                    self.dirty = true;
                 }
                 Action::ToggleSettings => {
                     self.show_settings = !self.show_settings;
@@ -760,14 +777,11 @@ impl SonadialApp {
                 }
                 Action::ToggleVisualMode => {
                     if self.piano_mode {
-                        self.piano_mode = false;
+                        self.set_piano_mode(false);
                         self.set_dot_style(false);
                     } else if self.dot_style() {
-                        self.piano_mode = true;
-                        self.piano_history.clear();
-                        self.dirty = true;
+                        self.set_piano_mode(true);
                     } else {
-                        self.piano_mode = false;
                         self.set_dot_style(true);
                     }
                 }
@@ -1023,9 +1037,13 @@ impl SonadialApp {
 
         let output_dir = storage::download_dir();
         let _ = std::fs::create_dir_all(&output_dir);
+        let proxy = {
+            let proxy = self.proxy.trim().to_owned();
+            (!proxy.is_empty()).then_some(proxy)
+        };
         let (sender, receiver) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        download::spawn(input, output_dir, sender, Arc::clone(&cancel));
+        download::spawn(input, output_dir, proxy, sender, Arc::clone(&cancel));
         self.download_rx = Some(receiver);
         self.download_cancel = Some(cancel);
         self.download_progress = 0.0;
@@ -1229,6 +1247,7 @@ impl SonadialApp {
     fn start_note_analysis(&mut self, path: &Path) {
         self.cancel_note_analysis();
         self.offline_notes = None;
+        self.notes_path = None;
         self.notes_state = NotesState::Running;
         self.note_generation = self.note_generation.wrapping_add(1);
         let generation = self.note_generation;
@@ -1258,6 +1277,9 @@ impl SonadialApp {
     fn cancel_note_analysis(&mut self) {
         if let Some(handle) = self.note_analysis.take() {
             handle.cancel.store(true, Ordering::Relaxed);
+            if self.notes_state == NotesState::Running {
+                self.notes_state = NotesState::Idle;
+            }
         }
     }
 
@@ -1282,10 +1304,12 @@ impl SonadialApp {
                 match result.analysis {
                     Ok(analysis) => {
                         self.offline_notes = Some(analysis);
+                        self.notes_path = Some(result.path.clone());
                         self.notes_state = NotesState::Ready;
                     }
                     Err(_) => {
                         self.offline_notes = None;
+                        self.notes_path = None;
                         self.notes_state = NotesState::Failed;
                     }
                 }
@@ -1293,6 +1317,33 @@ impl SonadialApp {
         } else if disconnected {
             self.note_analysis = None;
             self.notes_state = NotesState::Failed;
+        }
+    }
+
+    /// Piano mode is the only consumer of the offline note transcription, so the
+    /// whole-song decode only runs while it is on. Turning it off frees the
+    /// result again; turning it back on hits the on-disk cache.
+    fn set_piano_mode(&mut self, on: bool) {
+        if self.piano_mode == on {
+            return;
+        }
+        self.piano_mode = on;
+        self.piano_history.clear();
+        self.dirty = true;
+        if on {
+            let Some(path) = self.current_track().map(|track| track.path.clone()) else {
+                return;
+            };
+            let ready = self.notes_state == NotesState::Ready
+                && self.notes_path.as_deref() == Some(path.as_path());
+            if !ready && self.note_analysis.is_none() {
+                self.start_note_analysis(&path);
+            }
+        } else {
+            self.cancel_note_analysis();
+            self.offline_notes = None;
+            self.notes_path = None;
+            self.notes_state = NotesState::Idle;
         }
     }
 
@@ -1395,13 +1446,10 @@ impl SonadialApp {
         self.core_ring_strength = 0.0;
         self.cancel_beat_analysis();
         self.clear_offline_beats();
-        let path_key = track.path.to_string_lossy().to_string();
-        self.volume = self
-            .track_volumes
-            .get(&path_key)
-            .copied()
-            .unwrap_or(self.default_volume)
-            .clamp(0.0, 1.25);
+        self.cancel_note_analysis();
+        self.offline_notes = None;
+        self.notes_path = None;
+        self.notes_state = NotesState::Idle;
         self.engine.set_volume(self.volume);
         self.engine.set_eq(&self.eq_gains, self.eq_enabled);
         let opened = match park_at {
@@ -1424,7 +1472,9 @@ impl SonadialApp {
                 self.output_label = self.engine.output_label();
                 self.engine.set_volume(self.volume);
                 self.start_beat_analysis(&track.path);
-                self.start_note_analysis(&track.path);
+                if self.piano_mode {
+                    self.start_note_analysis(&track.path);
+                }
                 if let Some(target) = park_at {
                     // The stream is already parked, so this seek only moves the
                     // buffer and the clock; the user still has to press PLAY.
@@ -1466,6 +1516,13 @@ impl SonadialApp {
             self.history.truncate(self.history_pos + 1);
             self.history.push(path.to_owned());
             self.history_pos = self.history.len() - 1;
+        }
+        // A long session would otherwise keep every visited path forever.
+        const HISTORY_LIMIT: usize = 200;
+        if self.history.len() > HISTORY_LIMIT {
+            let excess = self.history.len() - HISTORY_LIMIT;
+            self.history.drain(..excess);
+            self.history_pos = self.history_pos.saturating_sub(excess);
         }
     }
 
@@ -1702,6 +1759,7 @@ impl SonadialApp {
 
     fn stop(&mut self) {
         self.cancel_beat_analysis();
+        self.cancel_note_analysis();
         self.clear_offline_beats();
         self.engine.stop();
         self.engine.flush_analysis();
@@ -1749,7 +1807,6 @@ impl SonadialApp {
             return;
         };
         let path = track.path;
-        let key = path.to_string_lossy().to_string();
         let is_current = self.current == Some(index);
 
         if is_current {
@@ -1770,7 +1827,6 @@ impl SonadialApp {
                 self.selected_track = Some(selected - 1);
             }
         }
-        self.track_volumes.remove(&key);
         self.next_queue.retain(|queued| queued != &path);
         self.rebuild_shuffle_order();
         if is_current {
@@ -1807,6 +1863,10 @@ impl SonadialApp {
     }
 
     fn next_track(&mut self) {
+        self.advance_track(false);
+    }
+
+    fn advance_track(&mut self, automatic: bool) {
         if self.playlist.is_empty() {
             return;
         }
@@ -1820,7 +1880,7 @@ impl SonadialApp {
         // If the user stepped backwards, Next walks forward through the same
         // history before choosing a new track. Shuffle skips this and follows
         // its own fixed random order in both directions.
-        if self.play_mode != PlayMode::Shuffle {
+        if self.play_mode == PlayMode::Sequence {
             for position in self.history_pos + 1..self.history.len() {
                 let path = self.history[position].clone();
                 if let Some(index) = self.playlist.iter().position(|track| track.path == path) {
@@ -1835,9 +1895,9 @@ impl SonadialApp {
             return;
         };
         let next = match self.play_mode {
-            PlayMode::RepeatOne => current,
+            PlayMode::RepeatOne if automatic => current,
             PlayMode::Shuffle => self.shuffle_step(current, true),
-            PlayMode::Sequence => (current + 1) % self.playlist.len(),
+            PlayMode::Sequence | PlayMode::RepeatOne => (current + 1) % self.playlist.len(),
         };
         self.play_index(next);
     }
@@ -1920,23 +1980,10 @@ impl SonadialApp {
         value
     }
 
-    /// Single volume path for the slider, keyboard and presets. The active
-    /// track keeps its own level; without a track the default is updated so
-    /// the choice survives the next playback start.
+    /// Single volume path for the slider and keyboard. The level is global:
+    /// switching tracks does not reset it, and `save_state` persists it.
     fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.25);
-        if let Some(index) = self.current {
-            if let Some(track) = self.playlist.get(index) {
-                let key = track.path.to_string_lossy().to_string();
-                if (self.volume - self.default_volume).abs() < 0.001 {
-                    self.track_volumes.remove(&key);
-                } else {
-                    self.track_volumes.insert(key, self.volume);
-                }
-            }
-        } else {
-            self.default_volume = self.volume;
-        }
         self.engine.set_volume(self.volume);
         self.dirty = true;
     }
@@ -2042,7 +2089,8 @@ impl SonadialApp {
             current: self
                 .current_track()
                 .map(|track| track.path.to_string_lossy().to_string()),
-            volume: self.default_volume,
+            volume: self.volume,
+            play_mode: self.play_mode.saved(),
             light: theme::is_light(),
             theme: self
                 .themes
@@ -2058,7 +2106,6 @@ impl SonadialApp {
             show_radial: self.show_radial,
             show_core_pulse: self.show_core_pulse,
             radial_scale: self.radial_scale,
-            track_volumes: self.track_volumes.clone(),
             eq_enabled: self.eq_enabled,
             eq_gains: self.eq_gains.to_vec(),
             eq_preset: self.eq_preset,
@@ -2071,6 +2118,7 @@ impl SonadialApp {
             peak_hold: self.peak_hold,
             show_lyrics: self.show_lyrics,
             piano_mode: self.piano_mode,
+            proxy: self.proxy.clone(),
         };
         storage::save(&state);
         if self.themes_dirty {
@@ -2306,15 +2354,14 @@ impl SonadialApp {
                 );
                 ui.add_space(tokens::SPACE_TIGHT);
 
-                let query = self.search.to_lowercase();
+                let query = self.search.trim().to_lowercase();
                 let filtered: Vec<usize> = self
                     .playlist
                     .iter()
                     .enumerate()
                     .filter(|(_, track)| {
                         query.is_empty()
-                            || track.title.to_lowercase().contains(&query)
-                            || track.path.to_string_lossy().to_lowercase().contains(&query)
+                            || track.search_index.matches(&query)
                     })
                     .map(|(index, _)| index)
                     .collect();
@@ -2508,27 +2555,33 @@ impl SonadialApp {
                             }
                         });
 
-                // TUI scrollbar: a dashed `│` track with one continuous square
-                // thumb. It stays faint until the pointer reaches the right
-                // edge, then becomes prominent.
+                // TUI scrollbar: a vertical mirror of the seek bar — a `#` thumb
+                // riding a `-` track. It stays faint until the pointer reaches
+                // the right edge, then becomes prominent.
                 let viewport = output.inner_rect;
                 let content_h = output.content_size.y;
                 let max_offset = (content_h - viewport.height()).max(0.0);
                 if max_offset > 0.5 {
                     let bar_w = 14.0;
                     let bar_x = viewport.right() - bar_w * 0.5;
-                    let thumb_w = 4.0;
-                    let thumb_h = (viewport.height() * viewport.height() / content_h)
-                        .clamp(viewport.height().min(24.0), viewport.height());
+                    let cell_h = 13.0;
+                    let track_top = viewport.top();
+                    let track_h = viewport.height().max(cell_h);
+                    let cells = (track_h / cell_h).floor().max(1.0) as usize;
+                    let pitch = track_h / cells as f32;
                     let offset = output.state.clamped_offset().y.clamp(0.0, max_offset);
-                    let thumb_y = viewport.top()
-                        + (viewport.height() - thumb_h) * (offset / max_offset);
+                    let frac = offset / max_offset;
+                    let thumb_cells = ((viewport.height() / content_h) * cells as f32)
+                        .round()
+                        .clamp(1.0, cells as f32) as usize;
+                    let thumb_start = ((cells - thumb_cells) as f32 * frac).round() as usize;
+                    let thumb_h = thumb_cells as f32 * pitch;
                     let thumb_rect = Rect::from_min_size(
-                        Pos2::new(bar_x - thumb_w * 0.5, thumb_y),
-                        Vec2::new(thumb_w, thumb_h),
+                        Pos2::new(bar_x - 2.0, track_top + thumb_start as f32 * pitch),
+                        Vec2::new(4.0, thumb_h),
                     );
                     let thumb_hit = Rect::from_min_size(
-                        Pos2::new(bar_x - bar_w * 0.5, thumb_y),
+                        Pos2::new(bar_x - bar_w * 0.5, thumb_rect.top()),
                         Vec2::new(bar_w, thumb_h),
                     );
                     let track_hit = Rect::from_min_size(
@@ -2562,22 +2615,29 @@ impl SonadialApp {
                     } else if near {
                         theme::text_dim()
                     } else {
-                        theme::alpha(theme::text_dim(), 45)
+                        theme::alpha(theme::text_dim(), 60)
                     };
-                    let track_color =
-                        theme::alpha(theme::text_dim(), if near { 95 } else { 24 });
+                    let empty_color =
+                        theme::alpha(theme::text_dim(), if near { 110 } else { 35 });
                     let painter = ui.painter().with_clip_rect(viewport);
-                    let rows = (viewport.height() / 12.0).floor().max(1.0) as usize;
-                    for i in 0..rows {
+                    let font = mono(12.0);
+                    let current_cell = self.current.and_then(|current| {
+                        filtered.iter().position(|&index| index == current).map(|row| {
+                            (((row as f32 + 0.5) / filtered.len() as f32) * cells as f32)
+                                .floor().min((cells - 1) as f32) as usize
+                        })
+                    });
+                    for i in 0..cells {
+                        let is_current = current_cell == Some(i);
+                        let in_thumb = i >= thumb_start && i < thumb_start + thumb_cells;
                         painter.text(
-                            Pos2::new(bar_x, viewport.top() + (i as f32 + 0.5) * 12.0),
+                            Pos2::new(bar_x, track_top + (i as f32 + 0.5) * pitch),
                             Align2::CENTER_CENTER,
-                            "│",
-                            mono(12.0),
-                            track_color,
+                            if is_current { "@" } else if in_thumb { "#" } else { "-" },
+                            font.clone(),
+                            if is_current { theme::text_hi() } else if in_thumb { thumb_color } else { empty_color },
                         );
                     }
-                    painter.rect_filled(thumb_rect, 0.0, thumb_color);
 
                     if thumb_response.drag_started() {
                         let pointer_y = ui
@@ -2589,8 +2649,8 @@ impl SonadialApp {
                     if thumb_response.dragged() {
                         if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
                             let grab = self.track_scroll_grab.unwrap_or(thumb_h * 0.5);
-                            let travel = (viewport.height() - thumb_h).max(1.0);
-                            let frac = ((pointer.y - grab - viewport.top()) / travel)
+                            let travel = (track_h - thumb_h).max(1.0);
+                            let frac = ((pointer.y - grab - track_top) / travel)
                                 .clamp(0.0, 1.0);
                             self.track_scroll_target = Some(frac * max_offset);
                         }
@@ -2600,8 +2660,8 @@ impl SonadialApp {
                     }
                     if track_response.clicked() && !thumb_response.hovered() {
                         if let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) {
-                            let travel = (viewport.height() - thumb_h).max(1.0);
-                            let frac = ((pointer.y - viewport.top() - thumb_h * 0.5)
+                            let travel = (track_h - thumb_h).max(1.0);
+                            let frac = ((pointer.y - track_top - thumb_h * 0.5)
                                 / travel)
                                 .clamp(0.0, 1.0);
                             self.track_scroll_target = Some(frac * max_offset);
@@ -2928,11 +2988,7 @@ impl SonadialApp {
                 painter.text(
                     Pos2::new(vol_x, vol_y),
                     Align2::LEFT_CENTER,
-                    if self.current.is_some() {
-                        "TRK ["
-                    } else {
-                        "VOL ["
-                    },
+                    "VOL [",
                     mono(12.0),
                     theme::text_dim(),
                 );
@@ -3242,6 +3298,44 @@ impl SonadialApp {
                 if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
                     self.start_download();
                 }
+                ui.add_space(tokens::SPACE_2);
+
+                // Optional proxy. A proxy resolves the host itself, so this is
+                // also the escape hatch when the system DNS keeps failing.
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("PROXY")
+                            .font(mono(10.0))
+                            .color(theme::text_dim()),
+                    );
+                    let env = self.env_proxy.clone();
+                    let reserved = if env.is_some() && self.proxy.trim().is_empty() {
+                        56.0
+                    } else {
+                        0.0
+                    };
+                    let width = (ui.available_width() - reserved).max(80.0);
+                    let changed = ui
+                        .add_sized(
+                            [width, tokens::FIELD_H],
+                            TextEdit::singleline(&mut self.proxy)
+                                .hint_text("DIRECT / 127.0.0.1:7890")
+                                .font(mono(11.0))
+                                .text_color(theme::text())
+                                .frame(Frame::NONE),
+                        )
+                        .changed();
+                    if changed {
+                        self.dirty = true;
+                    }
+                    if let Some(env) = env {
+                        if self.proxy.trim().is_empty() && tui_button(ui, "[ ENV ]", 52.0).clicked()
+                        {
+                            self.proxy = env;
+                            self.dirty = true;
+                        }
+                    }
+                });
                 ui.add_space(tokens::SPACE_3);
 
                 ui.horizontal(|ui| {
@@ -3834,7 +3928,7 @@ impl SonadialApp {
                                         )
                                         .clicked()
                                         {
-                                            self.piano_mode = false;
+                                            self.set_piano_mode(false);
                                             self.set_dot_style(false);
                                         }
                                         if tui_button(
@@ -3847,7 +3941,7 @@ impl SonadialApp {
                                         )
                                         .clicked()
                                         {
-                                            self.piano_mode = false;
+                                            self.set_piano_mode(false);
                                             self.set_dot_style(true);
                                         }
                                         if tui_button(
@@ -3857,9 +3951,7 @@ impl SonadialApp {
                                         )
                                         .clicked()
                                         {
-                                            self.piano_mode = true;
-                                            self.piano_history.clear();
-                                            self.dirty = true;
+                                            self.set_piano_mode(true);
                                         }
                                     });
                                     ui.add_space(tokens::SPACE_3);
@@ -4119,9 +4211,13 @@ impl SonadialApp {
 }
 
 impl eframe::App for SonadialApp {
+    fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        // eframe keeps logic ticking while minimized/occluded, without drawing UI.
+        self.tick(ctx);
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.tick(&ctx);
         self.handle_input(&ctx);
         self.paint_background(&ctx);
 
@@ -4136,10 +4232,19 @@ impl eframe::App for SonadialApp {
         self.process_actions(&ctx, actions);
     }
 
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        // The glyph atlas width follows the GPU's maximum texture side. On a
+        // 16k-capable driver that makes every glyph row 64 KiB, and the 80%
+        // auto-clear threshold is never reached. This app uploads no other
+        // textures, so a smaller cap keeps the atlas small and clearable.
+        raw_input.max_texture_side = Some(2048);
+    }
+
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(cancel) = &self.download_cancel {
             cancel.store(true, Ordering::Relaxed);
         }
+        self.cancel_beat_analysis();
         self.cancel_note_analysis();
         self.save_state();
     }
@@ -4150,7 +4255,8 @@ fn entry_for_path(path: PathBuf, lrc: Option<PathBuf>) -> TrackEntry {
         .file_stem()
         .map(|stem| stem.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string());
-    TrackEntry { path, title, lrc }
+    let search_index = crate::search::SearchIndex::new(&format!("{}\n{}", title, path.to_string_lossy()));
+    TrackEntry { path, title, lrc, search_index }
 }
 
 fn resolve_lrc(path: &Path, lrc_map: &HashMap<String, PathBuf>) -> Option<PathBuf> {
@@ -4412,6 +4518,16 @@ fn mono(size: f32) -> FontId {
 
 fn title(size: f32) -> FontId {
     FontId::new(snap_px(size), FontFamily::Name("ui".into()))
+}
+
+/// Proxy the machine already advertises. The downloader ignores these by
+/// default, but offering them keeps the app from having to be configured twice.
+fn env_proxy() -> Option<String> {
+    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+        .iter()
+        .find_map(|key| std::env::var(key).ok())
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn paint_card(painter: &egui::Painter, rect: Rect, _radius: f32, fill: Color32, border: Color32) {

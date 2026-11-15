@@ -8,3 +8,4 @@
 - Python 验证脚本放在临时目录即可，不要提交到仓库。
 - Rust 代码只在逻辑稳定后做一次 `cargo check`。
 - 最终交付前再做一次 release 编译，不要每改一处都重新构建。
+- release 编译后必须把 `target/release/sonadial_player.exe` 复制覆盖到 `dist/SonadialPlayer.exe`，保证 dist 里的可执行文件与最新源码一致。

@@ -1,17 +1,147 @@
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Mutex;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// A stalled audio stream is only detected when a single read times out, so a
+/// shorter timeout here means a dead CDN node is abandoned faster.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(15);
+/// How many full passes over the mirror list a download may make.
+const STREAM_ROUNDS: usize = 4;
+/// API requests are retried because a single DNS hiccup used to abort a whole
+/// download; Bilibili's resolver answers are also cached for a short while.
+const API_ATTEMPTS: usize = 3;
+const DNS_TTL: Duration = Duration::from_secs(120);
+/// AliDNS answers over HTTPS at this literal address, so it still works when
+/// the system resolver is the thing that is broken.
+const DOH_ENDPOINT: &str = "https://223.5.5.5/resolve";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36";
+
+/// Resolver with a short-lived cache and a DNS-over-HTTPS fallback.
+///
+/// `getaddrinfo` fails intermittently on machines with a VPN/DNS filter or an
+/// overloaded ISP resolver (Windows reports `os error 11001`). Since every
+/// Bilibili request needs a lookup, one bad answer used to kill the download;
+/// here a failed lookup is retried, then answered by AliDNS directly.
+#[derive(Default)]
+struct Resolver {
+    cache: Mutex<HashMap<String, (Instant, Vec<SocketAddr>)>>,
+}
+
+impl ureq::Resolver for Resolver {
+    fn resolve(&self, netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+        if let Ok(cache) = self.cache.lock() {
+            if let Some((at, addrs)) = cache.get(netloc) {
+                if at.elapsed() < DNS_TTL && !addrs.is_empty() {
+                    return Ok(addrs.clone());
+                }
+            }
+        }
+
+        let addrs = system_resolve(netloc).or_else(|system_error| {
+            doh_resolve(netloc).map_err(|_| system_error)
+        })?;
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(netloc.to_owned(), (Instant::now(), addrs.clone()));
+        }
+        Ok(addrs)
+    }
+}
+
+/// Builds an agent that either connects directly (with the resilient resolver
+/// above) or through the user's proxy. Behind a proxy the host name travels in
+/// `CONNECT`, so the proxy resolves DNS and the system resolver is out of the
+/// loop entirely.
+fn agent_builder(proxy: Option<&str>) -> ureq::AgentBuilder {
+    let builder = ureq::AgentBuilder::new().resolver(Resolver::default());
+    match proxy.map(str::trim).filter(|proxy| !proxy.is_empty()) {
+        Some(proxy) => match ureq::Proxy::new(proxy) {
+            Ok(parsed) => builder.proxy(parsed),
+            Err(_) => builder,
+        },
+        None => builder,
+    }
+}
+
+fn system_resolve(netloc: &str) -> std::io::Result<Vec<SocketAddr>> {
+    let mut last_error = None;
+    for attempt in 0..2 {
+        match netloc.to_socket_addrs() {
+            Ok(addrs) => {
+                let addrs: Vec<SocketAddr> = addrs.collect();
+                if !addrs.is_empty() {
+                    return Ok(addrs);
+                }
+            }
+            Err(error) => last_error = Some(error),
+        }
+        if attempt == 0 {
+            thread::sleep(Duration::from_millis(150));
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(ErrorKind::NotFound, "DNS 没有返回任何地址")
+    }))
+}
+
+fn doh_resolve(netloc: &str) -> Result<Vec<SocketAddr>> {
+    let (host, port) = split_host_port(netloc);
+    let url = format!("{DOH_ENDPOINT}?name={host}&type=A");
+    let text = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(5))
+        .build()
+        .get(&url)
+        .set("Accept", "application/dns-json")
+        .call()
+        .context("DNS over HTTPS 请求失败")?
+        .into_string()?;
+    let value: Value = serde_json::from_str(&text).context("DNS over HTTPS 响应无效")?;
+    let addrs: Vec<SocketAddr> = value
+        .get("Answer")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|answer| answer.get("type").and_then(Value::as_u64) == Some(1))
+        .filter_map(|answer| answer.get("data").and_then(Value::as_str))
+        .filter_map(|address| address.parse::<IpAddr>().ok())
+        .map(|address| SocketAddr::new(address, port))
+        .collect();
+    if addrs.is_empty() {
+        return Err(anyhow!("DNS over HTTPS 没有返回地址"));
+    }
+    Ok(addrs)
+}
+
+/// Splits `host:port` (or a bare host) into its parts; defaults to 443.
+fn split_host_port(netloc: &str) -> (String, u16) {
+    if let Some(rest) = netloc.strip_prefix('[') {
+        if let Some((host, tail)) = rest.split_once(']') {
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(443);
+            return (host.to_owned(), port);
+        }
+    }
+    match netloc.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|ch| ch.is_ascii_digit()) && !port.is_empty() => {
+            (host.to_owned(), port.parse().unwrap_or(443))
+        }
+        _ => (netloc.to_owned(), 443),
+    }
+}
 
 #[derive(Debug)]
 pub enum DownloadEvent {
@@ -23,7 +153,9 @@ pub enum DownloadEvent {
 }
 
 struct AudioSource {
-    url: String,
+    /// Mirrors for the same track: Bilibili hands out several CDN URLs and some
+    /// of them (notably the P2P `mcdn` nodes) stall or refuse connections.
+    urls: Vec<String>,
     codec: String,
     direct: bool,
 }
@@ -31,13 +163,14 @@ struct AudioSource {
 pub fn spawn(
     input: String,
     output_dir: PathBuf,
+    proxy: Option<String>,
     sender: Sender<DownloadEvent>,
     cancel: std::sync::Arc<AtomicBool>,
 ) {
     thread::Builder::new()
         .name("sonadial-bilibili".to_owned())
         .spawn(move || {
-            let result = download(&input, &output_dir, &sender, &cancel);
+            let result = download(&input, &output_dir, proxy.as_deref(), &sender, &cancel);
             match result {
                 Ok(path) if !cancel.load(Ordering::Relaxed) => {
                     let _ = sender.send(DownloadEvent::Done(path));
@@ -59,10 +192,11 @@ pub fn spawn(
 fn download(
     input: &str,
     output_dir: &Path,
+    proxy: Option<&str>,
     sender: &Sender<DownloadEvent>,
     cancel: &AtomicBool,
 ) -> Result<PathBuf> {
-    let agent = ureq::AgentBuilder::new()
+    let agent = agent_builder(proxy)
         .timeout_connect(REQUEST_TIMEOUT)
         .timeout_read(REQUEST_TIMEOUT)
         .timeout_write(REQUEST_TIMEOUT)
@@ -89,16 +223,7 @@ fn download(
 
     status(sender, "RESOLVING VIDEO");
     let view_url = format!("https://api.bilibili.com/x/web-interface/view?bvid={bvid}");
-    let view: Value = serde_json::from_str(
-        &agent
-            .get(&view_url)
-            .set("User-Agent", USER_AGENT)
-            .set("Referer", "https://www.bilibili.com/")
-            .call()
-            .context("获取视频信息失败")?
-            .into_string()?,
-    )
-    .context("视频信息不是有效 JSON")?;
+    let view = fetch_json(&agent, &view_url).context("获取视频信息失败")?;
     check_api(&view, "获取视频信息失败")?;
 
     let data = view
@@ -114,16 +239,7 @@ fn download(
     let play_url = format!(
         "https://api.bilibili.com/x/player/playurl?bvid={bvid}&cid={cid}&qn=0&fnval=16&fourk=1"
     );
-    let play: Value = serde_json::from_str(
-        &agent
-            .get(&play_url)
-            .set("User-Agent", USER_AGENT)
-            .set("Referer", "https://www.bilibili.com/")
-            .call()
-            .context("获取音频地址失败")?
-            .into_string()?,
-    )
-    .context("音频地址不是有效 JSON")?;
+    let play = fetch_json(&agent, &play_url).context("获取音频地址失败")?;
     check_api(&play, "获取音频地址失败")?;
 
     let source = best_audio_source(&play).ok_or_else(|| anyhow!("没有找到可下载的音轨"))?;
@@ -140,7 +256,7 @@ fn download(
     ));
 
     status(sender, "DOWNLOADING");
-    let result = download_stream(&agent, &source.url, &temp, sender, cancel);
+    let result = download_stream(&source.urls, &temp, proxy, sender, cancel);
     if let Err(error) = result {
         let _ = fs::remove_file(&temp);
         return Err(error);
@@ -308,6 +424,33 @@ fn check_api(value: &Value, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// GETs a JSON document, retrying transient network and body failures.
+/// Bilibili API errors (`code != 0`) are not retried: those are answers, not
+/// transport problems.
+fn fetch_json(agent: &ureq::Agent, url: &str) -> Result<Value> {
+    let mut last_error = None;
+    for attempt in 0..API_ATTEMPTS {
+        let result = agent
+            .get(url)
+            .set("User-Agent", USER_AGENT)
+            .set("Referer", "https://www.bilibili.com/")
+            .call()
+            .map_err(|error| anyhow!("{error}"))
+            .and_then(|response| response.into_string().map_err(|error| anyhow!("{error}")))
+            .and_then(|text| serde_json::from_str(&text).map_err(|error| anyhow!("{error}")));
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                last_error = Some(error);
+                if attempt + 1 < API_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(250 * (attempt as u64 + 1)));
+                }
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("请求失败")))
+}
+
 fn best_audio_source(play: &Value) -> Option<AudioSource> {
     let data = play.get("data")?;
 
@@ -349,24 +492,58 @@ fn best_audio_source(play: &Value) -> Option<AudioSource> {
         .and_then(|item| item.get("url"))
         .and_then(Value::as_str)
         .map(|url| AudioSource {
-            url: url.to_owned(),
+            urls: vec![url.to_owned()],
             codec: "durl".to_owned(),
             direct: false,
         })
 }
 
+/// Whether a URL points at a Bilibili P2P/edge node. These hosts answer the
+/// request and then often stop sending data, so plain CDN mirrors are tried
+/// first and P2P only as a last resort.
+fn is_p2p_mirror(url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    host.contains("mcdn") || host.contains("szbdyd") || host.contains("p2p")
+}
+
 fn audio_source(item: &Value, direct: bool) -> Option<AudioSource> {
-    let url = item
+    let mut urls: Vec<String> = Vec::new();
+    let base = item
         .get("baseUrl")
         .or_else(|| item.get("base_url"))
-        .and_then(Value::as_str)?;
+        .and_then(Value::as_str);
+    for url in base.into_iter().chain(
+        ["backupUrl", "backup_url"]
+            .iter()
+            .filter_map(|key| item.get(*key))
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(Value::as_str),
+    ) {
+        if !url.is_empty() && !urls.iter().any(|seen| seen == url) {
+            urls.push(url.to_owned());
+        }
+    }
+    if urls.is_empty() {
+        return None;
+    }
+    // Stable sort: keeps Bilibili's own ordering among plain CDN mirrors.
+    urls.sort_by_key(|url| is_p2p_mirror(url));
+
     let codec = item
         .get("codecs")
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_owned();
     Some(AudioSource {
-        url: url.to_owned(),
+        urls,
         codec,
         direct,
     })
@@ -382,30 +559,115 @@ fn move_into_place(from: &Path, to: &Path) -> Result<()> {
 }
 
 fn download_stream(
-    agent: &ureq::Agent,
-    url: &str,
+    urls: &[String],
     temp: &Path,
+    proxy: Option<&str>,
     sender: &Sender<DownloadEvent>,
     cancel: &AtomicBool,
 ) -> Result<()> {
-    let response = agent
+    let stream_agent = agent_builder(proxy)
+        .timeout_connect(REQUEST_TIMEOUT)
+        .timeout_read(STREAM_TIMEOUT)
+        .timeout_write(STREAM_TIMEOUT)
+        .build();
+
+    let mut downloaded = 0_u64;
+    let mut total = 0_u64;
+    let mut last_error: Option<anyhow::Error> = None;
+
+    // A CDN node that stops sending mid-transfer is retried from the byte we
+    // already have, so a dead mirror only costs the time it takes to notice.
+    for _ in 0..STREAM_ROUNDS {
+        for url in urls {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(anyhow!("cancelled"));
+            }
+            match fetch_into(
+                &stream_agent,
+                url,
+                temp,
+                &mut downloaded,
+                &mut total,
+                sender,
+                cancel,
+            ) {
+                Ok(true) => {
+                    if downloaded == 0 {
+                        return Err(anyhow!("音频流为空"));
+                    }
+                    return Ok(());
+                }
+                Ok(false) => {
+                    last_error = Some(anyhow!(
+                        "镜像返回的数据不完整（{downloaded}/{total} 字节）"
+                    ));
+                }
+                Err(error) if cancel.load(Ordering::Relaxed) => return Err(error),
+                Err(error) => last_error = Some(error),
+            }
+            let _ = sender.send(DownloadEvent::Progress(-1.0));
+        }
+    }
+
+    if downloaded == 0 {
+        return Err(anyhow!("音频流为空"));
+    }
+    let detail = last_error
+        .map(|error| format!("{error:#}"))
+        .unwrap_or_else(|| "未知错误".to_owned());
+    Err(anyhow!(
+        "音频流读取失败，已尝试 {} 个镜像（已下载 {downloaded} 字节）: {detail}",
+        urls.len()
+    ))
+}
+
+/// Fetches `url` into `temp`, resuming at `*downloaded` when possible.
+/// Returns `true` once the whole track has been written.
+fn fetch_into(
+    agent: &ureq::Agent,
+    url: &str,
+    temp: &Path,
+    downloaded: &mut u64,
+    total: &mut u64,
+    sender: &Sender<DownloadEvent>,
+    cancel: &AtomicBool,
+) -> Result<bool> {
+    let mut request = agent
         .get(url)
         .set("User-Agent", USER_AGENT)
-        .set("Referer", "https://www.bilibili.com/")
-        .call()
-        .context("下载音频流失败")?;
-    let total = response
+        .set("Referer", "https://www.bilibili.com/");
+    if *downloaded > 0 {
+        request = request.set("Range", &format!("bytes={}-", *downloaded));
+    }
+    let response = request.call().context("下载音频流失败")?;
+
+    let length = response
         .header("Content-Length")
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    if total == 0 {
+    // A mirror that ignores `Range` answers 200 with the full body, in which
+    // case the partial file has to be thrown away.
+    let resuming = *downloaded > 0 && response.status() == 206 && length > 0;
+    if resuming {
+        *total = *downloaded + length;
+    } else {
+        *downloaded = 0;
+        *total = length;
+    }
+    if *total == 0 {
         let _ = sender.send(DownloadEvent::Progress(-1.0));
     }
 
     let mut reader = response.into_reader();
-    let mut file = File::create(temp).context("无法创建临时音频文件")?;
+    let mut file = if resuming {
+        OpenOptions::new()
+            .append(true)
+            .open(temp)
+            .context("无法打开临时音频文件")?
+    } else {
+        File::create(temp).context("无法创建临时音频文件")?
+    };
     let mut buffer = [0_u8; 64 * 1024];
-    let mut downloaded = 0_u64;
     let mut last_percent = -1_i32;
 
     loop {
@@ -418,9 +680,9 @@ fn download_stream(
         }
         file.write_all(&buffer[..read])
             .context("写入临时音频文件失败")?;
-        downloaded += read as u64;
-        if total > 0 {
-            let percent = ((downloaded.saturating_mul(100) / total).min(100)) as i32;
+        *downloaded += read as u64;
+        if *total > 0 {
+            let percent = ((*downloaded).saturating_mul(100) / *total).min(100) as i32;
             if percent != last_percent {
                 last_percent = percent;
                 let _ = sender.send(DownloadEvent::Progress(percent as f32 / 100.0));
@@ -429,10 +691,7 @@ fn download_stream(
     }
     file.flush().ok();
 
-    if downloaded == 0 {
-        return Err(anyhow!("音频流为空"));
-    }
-    Ok(())
+    Ok(*total == 0 || *downloaded >= *total)
 }
 
 fn convert_audio(input: &Path, output: &Path, cancel: &AtomicBool, allow_copy: bool) -> Result<()> {

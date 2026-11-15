@@ -1,22 +1,25 @@
 //! Offline beat analysis for the core pulse.
 //!
-//! The track is decoded to 22.05kHz mono, heavy beats are picked from the low
-//! band first, and mid-band transients provide the sparse light pulses. Results
-//! are cached by path, size and mtime so replaying a track is instant.
+//! The track is streamed through a 22.05kHz mono decoder in small chunks, so
+//! analysis never holds a decoded copy of the whole song. Heavy beats are
+//! picked from the low band first, and mid-band transients provide the sparse
+//! light pulses. Results are cached by path, size and mtime so replaying a
+//! track is instant.
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use rustfft::num_complex::Complex;
-use rustfft::FftPlanner;
+use rustfft::{Fft, FftPlanner};
 use serde::{Deserialize, Serialize};
 
 use crate::beat_config::BeatConfig;
+use crate::cache_store;
 use crate::sound_profile::{BandCurves, ProfileFrames, SoundProfile};
 use crate::storage;
 
@@ -56,6 +59,8 @@ struct FileSignature {
     mtime_ms: u64,
 }
 
+/// Legacy single-file cache layout; only parsed once during migration, never
+/// written anymore.
 #[derive(Serialize, Deserialize, Default)]
 struct BeatCacheFile {
     #[serde(default)]
@@ -96,98 +101,207 @@ pub fn analyze_file(path: &Path, cancel: &AtomicBool, config: &BeatConfig) -> Re
         });
     }
 
-    let samples = decode_mono(path, cancel)?;
-    if cancel.load(Ordering::Relaxed) {
-        return Err(anyhow!("beat analysis cancelled"));
-    }
-    let analysis = analyze_pcm(&samples, cancel, config)?;
+    // The track is streamed through the frame pass; no full decoded copy of
+    // the song is ever held in memory, so the peak stays flat.
+    let analysis = analyze_streamed(path, cancel, config)?;
     if let Some(signature) = signature {
         store_cache_entry(path, signature, &analysis, config_hash);
     }
     Ok(analysis)
 }
 
-fn decode_mono(path: &Path, cancel: &AtomicBool) -> Result<Vec<f32>> {
-    crate::decode::decode_mono(path, ANALYSIS_RATE, cancel)
+/// Runs the frame pass while the track is decoded in small chunks. No full
+/// decoded copy of the song is ever held in memory, so the peak stays flat.
+fn analyze_streamed(
+    path: &Path,
+    cancel: &AtomicBool,
+    config: &BeatConfig,
+) -> Result<BeatAnalysis> {
+    let mut pass = FramePass::new();
+    if !pass.usable() {
+        return Ok(BeatAnalysis::default());
+    }
+    // The sink returns false to stop early, which only happens on cancel.
+    let ran_to_end = crate::decode::decode_mono_streamed(
+        path,
+        ANALYSIS_RATE,
+        cancel,
+        &mut |chunk: &[f32]| {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            pass.push(chunk);
+            true
+        },
+    )?;
+    if !ran_to_end || cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("beat analysis cancelled"));
+    }
+    finish_pass(pass, config)
 }
 
+/// The same frame pass over an in-memory buffer, fed in blocks that are not
+/// hop-aligned, so the sliding-window realignment is exercised too.
 fn analyze_pcm(samples: &[f32], cancel: &AtomicBool, config: &BeatConfig) -> Result<BeatAnalysis> {
-    if samples.len() < FRAME_SIZE * 4 {
+    let mut pass = FramePass::new();
+    if !pass.usable() {
         return Ok(BeatAnalysis::default());
     }
-
-    let frame_rate = ANALYSIS_RATE as f32 / HOP_SIZE as f32;
-    let bin_hz = ANALYSIS_RATE as f32 / FRAME_SIZE as f32;
-    let bins = FRAME_SIZE / 2 + 1;
-    let low_start = (LOW_CUT_HZ / bin_hz).ceil() as usize;
-    let low_end = ((LOW_HIGH_HZ / bin_hz).floor() as usize).min(bins - 1);
-    let wide_start = low_start;
-    let wide_end = ((WIDE_HIGH_HZ / bin_hz).floor() as usize).min(bins - 1);
-    let mid_start = (low_end + 1).min(bins - 1);
-    let mid_end = ((SOFT_HIGH_HZ / bin_hz).floor() as usize).min(bins - 1);
-    let high_start = ((SOFT_HIGH_HZ / bin_hz).ceil() as usize).min(wide_end);
-    if low_start > low_end || mid_start > mid_end {
-        return Ok(BeatAnalysis::default());
-    }
-
-    let frame_count = 1 + (samples.len() - FRAME_SIZE) / HOP_SIZE;
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(FRAME_SIZE);
-    let window = (0..FRAME_SIZE)
-        .map(|index| {
-            let x = std::f32::consts::TAU * index as f32 / (FRAME_SIZE - 1) as f32;
-            0.5 - 0.5 * x.cos()
-        })
-        .collect::<Vec<f32>>();
-    let mut buffer = vec![Complex::new(0.0_f32, 0.0_f32); FRAME_SIZE];
-    let mut low_energy = Vec::with_capacity(frame_count);
-    let mut wide_energy = Vec::with_capacity(frame_count);
-    let mut mid_energy = Vec::with_capacity(frame_count);
-    let mut high_energy = Vec::with_capacity(frame_count);
-    let mut frame_power = Vec::with_capacity(frame_count);
-    let mut profile_frames = ProfileFrames::with_capacity(frame_count);
-
-    for frame in 0..frame_count {
-        if frame % 512 == 0 && cancel.load(Ordering::Relaxed) {
+    for chunk in samples.chunks(1000) {
+        if cancel.load(Ordering::Relaxed) {
             return Err(anyhow!("beat analysis cancelled"));
         }
-        let start = frame * HOP_SIZE;
-        let mut square_sum = 0.0;
-        for index in 0..FRAME_SIZE {
-            let sample = samples[start + index];
-            square_sum += sample * sample;
-            buffer[index] = Complex::new(sample * window[index], 0.0);
-        }
-        frame_power.push(square_sum / FRAME_SIZE as f32);
-        fft.process(&mut buffer);
-        profile_frames.push(&samples[start..start + FRAME_SIZE], &buffer, bin_hz);
+        pass.push(chunk);
+    }
+    finish_pass(pass, config)
+}
 
-        let mut low = 0.0;
-        let mut wide = 0.0;
-        let mut mid = 0.0;
-        let mut high = 0.0;
-        for bin in low_start..=low_end {
-            let value = buffer[bin];
-            low += value.re * value.re + value.im * value.im;
+/// Turns streamed mono samples into per-frame band energies and the sound
+/// profile accumulator. Chunks may arrive in any size; a sliding carry buffer
+/// realigns them into the overlapping analysis frames.
+struct FramePass {
+    fft: Arc<dyn Fft<f32>>,
+    window: Vec<f32>,
+    buffer: Vec<Complex<f32>>,
+    bin_hz: f32,
+    low_start: usize,
+    low_end: usize,
+    wide_start: usize,
+    wide_end: usize,
+    mid_start: usize,
+    mid_end: usize,
+    high_start: usize,
+    low_energy: Vec<f32>,
+    wide_energy: Vec<f32>,
+    mid_energy: Vec<f32>,
+    high_energy: Vec<f32>,
+    frame_power: Vec<f32>,
+    profile_frames: ProfileFrames,
+    carry: Vec<f32>,
+    frames_done: usize,
+    total_samples: usize,
+}
+
+impl FramePass {
+    fn new() -> Self {
+        let bin_hz = ANALYSIS_RATE as f32 / FRAME_SIZE as f32;
+        let bins = FRAME_SIZE / 2 + 1;
+        let low_start = (LOW_CUT_HZ / bin_hz).ceil() as usize;
+        let low_end = ((LOW_HIGH_HZ / bin_hz).floor() as usize).min(bins - 1);
+        let wide_start = low_start;
+        let wide_end = ((WIDE_HIGH_HZ / bin_hz).floor() as usize).min(bins - 1);
+        let mid_start = (low_end + 1).min(bins - 1);
+        let mid_end = ((SOFT_HIGH_HZ / bin_hz).floor() as usize).min(bins - 1);
+        let high_start = ((SOFT_HIGH_HZ / bin_hz).ceil() as usize).min(wide_end);
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(FRAME_SIZE);
+        let window = (0..FRAME_SIZE)
+            .map(|index| {
+                let x = std::f32::consts::TAU * index as f32 / (FRAME_SIZE - 1) as f32;
+                0.5 - 0.5 * x.cos()
+            })
+            .collect::<Vec<f32>>();
+        Self {
+            fft,
+            window,
+            buffer: vec![Complex::new(0.0_f32, 0.0_f32); FRAME_SIZE],
+            bin_hz,
+            low_start,
+            low_end,
+            wide_start,
+            wide_end,
+            mid_start,
+            mid_end,
+            high_start,
+            low_energy: Vec::new(),
+            wide_energy: Vec::new(),
+            mid_energy: Vec::new(),
+            high_energy: Vec::new(),
+            frame_power: Vec::new(),
+            profile_frames: ProfileFrames::with_capacity(0),
+            carry: Vec::new(),
+            frames_done: 0,
+            total_samples: 0,
         }
-        for bin in wide_start..=wide_end {
-            let value = buffer[bin];
-            let power = value.re * value.re + value.im * value.im;
-            wide += power;
-            if bin >= high_start {
-                high += power;
-            }
-        }
-        for bin in mid_start..=mid_end {
-            let value = buffer[bin];
-            mid += value.re * value.re + value.im * value.im;
-        }
-        low_energy.push(low);
-        wide_energy.push(wide);
-        mid_energy.push(mid);
-        high_energy.push(high);
     }
 
+    fn usable(&self) -> bool {
+        self.low_start <= self.low_end && self.mid_start <= self.mid_end
+    }
+
+    fn push(&mut self, chunk: &[f32]) {
+        self.carry.extend_from_slice(chunk);
+        self.total_samples += chunk.len();
+        let frames_here = if self.carry.len() >= FRAME_SIZE {
+            1 + (self.carry.len() - FRAME_SIZE) / HOP_SIZE
+        } else {
+            0
+        };
+        for frame in 0..frames_here {
+            let start = frame * HOP_SIZE;
+            let frame_samples = &self.carry[start..start + FRAME_SIZE];
+            let mut square_sum = 0.0;
+            for index in 0..FRAME_SIZE {
+                let sample = frame_samples[index];
+                square_sum += sample * sample;
+                self.buffer[index] = Complex::new(sample * self.window[index], 0.0);
+            }
+            self.frame_power.push(square_sum / FRAME_SIZE as f32);
+            self.fft.process(&mut self.buffer);
+            self.profile_frames
+                .push(frame_samples, &self.buffer, self.bin_hz);
+
+            let mut low = 0.0;
+            let mut wide = 0.0;
+            let mut mid = 0.0;
+            let mut high = 0.0;
+            for bin in self.low_start..=self.low_end {
+                let value = self.buffer[bin];
+                low += value.re * value.re + value.im * value.im;
+            }
+            for bin in self.wide_start..=self.wide_end {
+                let value = self.buffer[bin];
+                let power = value.re * value.re + value.im * value.im;
+                wide += power;
+                if bin >= self.high_start {
+                    high += power;
+                }
+            }
+            for bin in self.mid_start..=self.mid_end {
+                let value = self.buffer[bin];
+                mid += value.re * value.re + value.im * value.im;
+            }
+            self.low_energy.push(low);
+            self.wide_energy.push(wide);
+            self.mid_energy.push(mid);
+            self.high_energy.push(high);
+        }
+        if frames_here > 0 {
+            self.carry.drain(0..frames_here * HOP_SIZE);
+            self.frames_done += frames_here;
+        }
+    }
+}
+
+/// The band curves, frame power and sound profile accumulator are consumed
+/// here; everything is per-frame data, so the raw samples are long gone.
+fn finish_pass(pass: FramePass, config: &BeatConfig) -> Result<BeatAnalysis> {
+    let FramePass {
+        low_energy,
+        wide_energy,
+        mid_energy,
+        high_energy,
+        frame_power,
+        profile_frames,
+        frames_done,
+        total_samples,
+        ..
+    } = pass;
+    let frame_count = frames_done;
+    if frame_count == 0 || total_samples < FRAME_SIZE * 4 {
+        return Ok(BeatAnalysis::default());
+    }
+    let frame_rate = ANALYSIS_RATE as f32 / HOP_SIZE as f32;
     let Some(low) = band_curve(&low_energy) else {
         return Ok(BeatAnalysis::default());
     };
@@ -589,9 +703,8 @@ fn file_signature(path: &Path) -> Option<FileSignature> {
     })
 }
 
-fn cache_path() -> PathBuf {
-    storage::data_dir().join("beat_cache.json")
-}
+/// Analysis cache kind: one JSON file per track under `analysis/beat`.
+const CACHE_KIND: &str = "beat";
 
 fn cache_lock() -> &'static Mutex<()> {
     CACHE_LOCK.get_or_init(|| Mutex::new(()))
@@ -604,26 +717,20 @@ fn cache_key(path: &Path) -> String {
         .to_string()
 }
 
-fn read_cache() -> BeatCacheFile {
-    fs::read_to_string(cache_path())
-        .ok()
-        .and_then(|text| serde_json::from_str(text.trim_start_matches('\u{feff}')).ok())
-        .unwrap_or_default()
-}
-
-fn write_cache(cache: &BeatCacheFile) {
-    let path = cache_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let Ok(data) = serde_json::to_vec(cache) else {
+/// One-time split of the legacy single-file cache: each track goes into its
+/// own file, then the big file is dropped. Unreadable or outdated caches are
+/// simply removed — those entries re-analyze on demand.
+fn migrate_legacy_cache() {
+    let legacy = storage::data_dir().join("beat_cache.json");
+    let Some(cache) = cache_store::read_json_file::<BeatCacheFile>(&legacy) else {
         return;
     };
-    let temp = path.with_extension("json.tmp");
-    if fs::write(&temp, data).is_ok() {
-        let _ = fs::remove_file(&path);
-        let _ = fs::rename(&temp, &path);
+    if cache.version == ANALYSIS_VERSION {
+        for (key, entry) in &cache.tracks {
+            cache_store::write_entry(CACHE_KIND, key, entry);
+        }
     }
+    let _ = fs::remove_file(&legacy);
 }
 
 fn load_cache_entry(
@@ -632,18 +739,15 @@ fn load_cache_entry(
     config_hash: u64,
 ) -> Option<BeatCacheEntry> {
     let _guard = cache_lock().lock().ok()?;
-    let cache = read_cache();
-    if cache.version != ANALYSIS_VERSION {
-        return None;
-    }
+    migrate_legacy_cache();
     let key = cache_key(path);
-    let entry = cache.tracks.get(&key)?;
+    let entry: BeatCacheEntry = cache_store::read_entry(CACHE_KIND, &key)?;
     if entry.version == ANALYSIS_VERSION
         && entry.config_hash == config_hash
         && entry.size == signature.size
         && entry.mtime_ms == signature.mtime_ms
     {
-        Some(entry.clone())
+        Some(entry)
     } else {
         None
     }
@@ -658,47 +762,23 @@ fn store_cache_entry(
     let Ok(_guard) = cache_lock().lock() else {
         return;
     };
-    let mut cache = read_cache();
-    if cache.version != ANALYSIS_VERSION {
-        cache.tracks.clear();
-    }
-    cache.version = ANALYSIS_VERSION;
-    let key = cache_key(path);
+    migrate_legacy_cache();
     let saved_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    cache.tracks.insert(
-        key,
-        BeatCacheEntry {
-            version: ANALYSIS_VERSION,
-            size: signature.size,
-            mtime_ms: signature.mtime_ms,
-            saved_at,
-            config_hash,
-            beats: analysis.beats.clone(),
-            bpm: analysis.bpm,
-            profile: analysis.profile,
-        },
-    );
-    prune_cache(&mut cache);
-    write_cache(&cache);
-}
-
-fn prune_cache(cache: &mut BeatCacheFile) {
-    if cache.tracks.len() <= 160 {
-        return;
-    }
-    let mut entries = cache
-        .tracks
-        .iter()
-        .map(|(key, entry)| (key.clone(), entry.saved_at))
-        .collect::<Vec<(String, u64)>>();
-    entries.sort_by_key(|(_, saved_at)| *saved_at);
-    let remove = cache.tracks.len() - 120;
-    for (key, _) in entries.into_iter().take(remove) {
-        cache.tracks.remove(&key);
-    }
+    let entry = BeatCacheEntry {
+        version: ANALYSIS_VERSION,
+        size: signature.size,
+        mtime_ms: signature.mtime_ms,
+        saved_at,
+        config_hash,
+        beats: analysis.beats.clone(),
+        bpm: analysis.bpm,
+        profile: analysis.profile,
+    };
+    cache_store::write_entry(CACHE_KIND, &cache_key(path), &entry);
+    cache_store::prune_entries(CACHE_KIND, 160, 120);
 }
 
 #[cfg(test)]

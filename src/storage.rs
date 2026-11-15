@@ -38,6 +38,9 @@ pub struct PersistedState {
     pub current: Option<String>,
     #[serde(default = "default_volume")]
     pub volume: f32,
+    /// 0 sequence, 1 repeat one, 2 shuffle.
+    #[serde(default)]
+    pub play_mode: u8,
     #[serde(default)]
     pub light: bool,
     /// Built-in index from before themes were saved by name; still written
@@ -66,8 +69,6 @@ pub struct PersistedState {
     pub show_core_pulse: bool,
     #[serde(default = "default_radial_scale")]
     pub radial_scale: f32,
-    #[serde(default)]
-    pub track_volumes: HashMap<String, f32>,
     #[serde(default = "default_true")]
     pub eq_enabled: bool,
     #[serde(default = "default_eq_gains")]
@@ -82,6 +83,11 @@ pub struct PersistedState {
     pub show_lyrics: bool,
     #[serde(default)]
     pub piano_mode: bool,
+    /// HTTP/SOCKS proxy for the Bilibili downloader, e.g.
+    /// `http://127.0.0.1:7890`. Empty means direct. A proxy also takes over
+    /// DNS, which is the point: the CONNECT carries the host name.
+    #[serde(default)]
+    pub proxy: String,
 }
 
 impl Default for PersistedState {
@@ -90,6 +96,7 @@ impl Default for PersistedState {
             playlist: Vec::new(),
             current: None,
             volume: default_volume(),
+            play_mode: 0,
             light: false,
             theme: None,
             theme_name: None,
@@ -101,7 +108,6 @@ impl Default for PersistedState {
             show_radial: true,
             show_core_pulse: true,
             radial_scale: default_radial_scale(),
-            track_volumes: HashMap::new(),
             eq_enabled: true,
             eq_gains: default_eq_gains(),
             eq_preset: default_eq_preset(),
@@ -109,6 +115,7 @@ impl Default for PersistedState {
             peak_hold: default_peak_hold(),
             show_lyrics: true,
             piano_mode: false,
+            proxy: String::new(),
         }
     }
 }
