@@ -1,38 +1,50 @@
 // Sonadial Player — Slint software-rendered UI (slint-ui branch).
-// Geometry mirrors src/viz.rs: usable/258 scale, inner_r = 120*scale,
-// max_amp = 100*scale. Radial bars use the player's LED look: each bar is a
-// column of small cells along its radius direction (dx/dy come pre-computed
-// from Rust, including the slow ring spin) because the software renderer
-// cannot rotate plain rectangles.
+// Faithful port of the egui-era TUI: frameless window with a custom top bar,
+// LIBRARY sidebar, dock console, stage labels and the SYSTEM/EQ/BILIBILI
+// overlay panels. The full-window stage (theme gradient, background LED wall,
+// radial spectrum, core dial, beat ring) is painted by the CPU in src/stage.rs
+// and delivered as an opaque image.
 
-// Theme colors, shared by the window and every component.
+// Theme colors for the chrome, pushed from Rust every frame.
 export global Theme {
-    in-out property <color> bg-top;
-    in-out property <color> bg-bottom;
-    in-out property <color> corner-tl;
-    in-out property <color> corner-br;
+    in-out property <color> c-bg;
     in-out property <color> c-bg-deep;
     in-out property <color> c-surface;
     in-out property <color> c-line;
     in-out property <color> c-text-hi;
     in-out property <color> c-text;
     in-out property <color> c-text-dim;
-    in-out property <color> c-ring;
-    in-out property <color> c-ring-hi;
+    in-out property <color> c-danger;
 }
 
-// Terminal-style text button.
-component Btn inherits Rectangle {
+// egui text_button: hover inverts into a solid text_hi block.
+component InkBtn inherits Rectangle {
     in property <string> label;
-    in property <bool> accent: false;
-    in property <bool> on: false;
+    in property <float> size: 12;
     callback clicked();
     height: 22px;
-    min-width: 44px;
-    border-width: 1px;
-    border-radius: 3px;
-    border-color: ta.has-hover ? Theme.c-line : #00000000;
-    background: ta.has-hover ? Theme.c-surface : #00000000;
+    background: ta.has-hover ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        font-size: root.size * 1px;
+        color: ta.has-hover ? Theme.c-bg : Theme.c-text-hi;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// egui tui_button: same inversion, but the resting ink is text().
+component TuiBtn inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+    height: 22px;
+    background: ta.has-hover ? Theme.c-text-hi : transparent;
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => root.clicked();
@@ -42,19 +54,151 @@ component Btn inherits Rectangle {
         height: parent.height;
         text: root.label;
         font-size: 12px;
-        color: root.accent || root.on || ta.has-hover
-            ? Theme.c-text-hi : Theme.c-text-dim;
+        color: ta.has-hover ? Theme.c-bg : Theme.c-text;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
 }
 
-export struct BarData {
-    len: float,
-    peak: float,
-    dx: float,
-    dy: float,
-    col: color,
+// egui tab_button (SYSTEM pages).
+component TabBtn inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked();
+    height: 22px;
+    background: ta.has-hover || root.active ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        font-size: 12px;
+        color: ta.has-hover || root.active ? Theme.c-bg : Theme.c-text-dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// egui close_x_button.
+component CloseX inherits Rectangle {
+    callback clicked();
+    width: 34px;
+    height: 24px;
+    background: ta.has-hover ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: "[x]";
+        font-size: 16px;
+        color: ta.has-hover ? Theme.c-bg : Theme.c-text-hi;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// egui theme_chip: gradient preview, name, active border, bottom ink strip.
+component ChipBtn inherits Rectangle {
+    in property <string> label;
+    in property <color> grad-a;
+    in property <color> grad-b;
+    in property <color> fg;
+    in property <color> dim;
+    in property <bool> active: false;
+    callback clicked();
+    height: 28px;
+    background: @linear-gradient(135deg, root.grad-a, root.grad-b);
+    border-width: root.active ? 2px : 1px;
+    border-color: root.active || ta.has-hover ? root.fg : root.dim;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        y: parent.height / 2 - self.height / 2 - 1px;
+        width: parent.width - 16px;
+        x: 8px;
+        height: 16px;
+        text: root.label;
+        font-size: 12px;
+        color: root.fg;
+        overflow: elide;
+    }
+    Rectangle {
+        y: parent.height - 3px;
+        x: 1px;
+        width: parent.width - 2px;
+        height: 2px;
+        background: root.fg;
+    }
+}
+
+// egui tui_menu_item.
+component MenuRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> danger: false;
+    callback clicked();
+    height: 24px;
+    background: ta.has-hover ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        x: 8px;
+        height: parent.height;
+        vertical-alignment: center;
+        text: ta.has-hover ? "> " + root.label : "  " + root.label;
+        font-size: 12px;
+        color: ta.has-hover ? Theme.c-bg : (root.danger ? Theme.c-danger : Theme.c-text);
+    }
+}
+
+export struct TrackRow {
+    index: int,
+    title: string,
+    meta: string,
+    has-lrc: bool,
+    selected: bool,
+    playing: bool,
+    focused: bool,
+}
+
+export struct ChipData {
+    name: string,
+    grad-a: color,
+    grad-b: color,
+    fg: color,
+    dim: color,
+    active: bool,
+    dark: bool,
+    index: int,
+    col: int,
+    row: int,
+}
+
+export struct ChipGroup {
+    label: string,
+    offset: int,
+    chips: [ChipData],
+}
+
+export struct ShortcutRow {
+    index: int,
+    keys: string,
+    desc: string,
+}
+
+export struct EqBandData {
+    gain: float,
+    label: string,
+    freq: string,
 }
 
 export component Main inherits Window {
@@ -62,323 +206,1695 @@ export component Main inherits Window {
     height: 760px;
     title: "Sonadial Player";
     default-font-family: "Sarasa Mono SC";
-    background: transparent;
+    no-frame: true;
+    resize-border-width: 6px;
+    background: Theme.c-bg;
 
-    // ---------- data ----------
-    in-out property <[BarData]> bars;
-    in-out property <float> radial-scale: 1.0;
-    in-out property <bool> show-bg-spectrum: true;
-    in-out property <bool> show-radial: true;
-    in-out property <bool> show-peaks: true;
-    in-out property <float> pulse: 0;    // 0..1 expanding beat ring intensity
-    in-out property <float> beat-age: 1; // 0..1 since the last launched ring
-    in-out property <float> kick: 0;     // 0..1 live low-band energy
+    // ---------- geometry ----------
+    in-out property <bool> sidebar-open: true;
+    property <length> sidebar-w: root.sidebar-open ? 360px : 0px;
+    in-out property <length> stage-x: root.sidebar-w;
+    in-out property <length> stage-y: 44px;
+    in-out property <length> stage-w: root.width - root.sidebar-w;
+    in-out property <length> stage-h: root.height - 44px - 124px;
 
-    // ---------- readout ----------
-    in-out property <string> time-text: "0:00 / 0:00";
-    in-out property <string> status-text: "[STANDBY]";
-    in-out property <string> track-title: "";
-    in-out property <string> theme-label: "MONO";
-    in-out property <string> mode-label: "SEQ";
+    // ---------- stage ----------
+    in-out property <image> stage;
+    in-out property <length> disc-r: 80px;
+    in-out property <length> grid-l: 100px;
+    in-out property <length> grid-r: 800px;
+    in-out property <length> grid-cx: 450px;
     in-out property <string> lyric-current: "";
     in-out property <string> lyric-next: "";
     in-out property <bool> lyric-active: false;
+    in-out property <bool> show-lyrics: true;
+
+    // ---------- playlist ----------
+    in-out property <[TrackRow]> tracks;
+    in-out property <string> search-text;
+    in-out property <int> track-count: 0;
+    in-out property <string> mode-short: "SQ";
+    in-out property <float> scroll-y: 0;
+    in-out property <float> scroll-max: 0;
+    in-out property <int> current-cell: -1;
+    in-out property <bool> scroll-active: false;
+    in-out property <int> context-index: -1;
+    in-out property <length> context-x: 0px;
+    in-out property <length> context-y: 0px;
+    in-out property <string> context-title: "";
+    in-out property <bool> context-has-lrc: false;
+
+    // ---------- dock ----------
+    in-out property <string> dock-title: "DROP AUDIO HERE / CTRL+O";
+    in-out property <bool> dock-title-live: false;
+    in-out property <string> meta-prefix: "---   0.0K   ";
+    in-out property <string> meta-output: "NO OUTPUT";
+    in-out property <string> mode-text: "MODE: SEQUENCE";
     in-out property <float> progress: 0;
-    in-out property <bool> paused: true;
-    in-out property <bool> has-track: false;
-    in-out property <float> volume: 0.78;
+    in-out property <int> seek-cells: 36;
+    in-out property <int> seek-filled: 0;
+    in-out property <string> seek-filled-str: "";
+    in-out property <string> seek-rest-str: "";
+    in-out property <string> time-text: "0:00 / 0:00";
+    in-out property <string> play-label: "PLAY";
+    in-out property <string> vol-fill-str: "";
+    in-out property <int> vol-filled: 0;
+    in-out property <string> vol-rest-str: "";
+    in-out property <string> vol-pct: " 62%";
+    property <length> seek-track-w: root.seek-cells * 13px;
 
-    // ---------- geometry (viz.rs mirror) ----------
-    property <length> usable: min(self.width, self.height) / 2 - 8px;
-    property <float> scale: clamp(usable / 1px / 258.0, 0.45, 2.4)
-        * clamp(root.radial-scale, 0.7, 1.2);
-    property <length> inner-r: min(120px * scale, usable * 0.75);
-    property <length> max-amp: min(100px * scale, usable - inner-r - 2px);
-    property <length> cell-step: max-amp / 12;
-    property <length> cell-size: max(3.4px * scale, 2.8px);
-    property <length> peak-size: max(3px * scale, 2px);
-    property <length> disc-r: inner-r * 0.669;
-    property <float> kick-scale: 1 + root.kick * 0.04;
+    // ---------- overlays ----------
+    in-out property <bool> show-settings: false;
+    in-out property <bool> show-eq: false;
+    in-out property <bool> show-download: false;
+    in-out property <int> settings-page: 0;
+    in-out property <string> out-label: "";
+    in-out property <string> state-path: "";
+    in-out property <string> mode-long: "SEQUENCE";
+    in-out property <float> radial-scale: 1.0;
+    in-out property <int> visual-style: 0;
+    in-out property <bool> show-bg-spectrum: true;
+    in-out property <bool> show-radial: true;
+    in-out property <bool> show-core-pulse: true;
+    in-out property <bool> peak-hold: true;
+    in-out property <string> theme-current-line: "CURRENT: --- / ---";
+    in-out property <string> theme-auto-status: "";
+    in-out property <string> theme-file-path: "";
+    in-out property <string> theme-load-error: "";
+    in-out property <string> theme-warnings: "";
+    in-out property <bool> theme-can-customize: true;
+    in-out property <string> theme-customize-label: "[ CUSTOMIZE ]";
+    in-out property <[ChipData]> auto-chips;
+    in-out property <[ChipGroup]> theme-groups;
+    in-out property <[ShortcutRow]> shortcuts;
 
+    // ---------- eq ----------
+    in-out property <[EqBandData]> eq-bands;
+    in-out property <bool> eq-enabled: false;
+    in-out property <string> eq-preset-name: "CUSTOM  ";
+    in-out property <string> eq-hint: "EQ BYPASS / DRAG TO EDIT";
+
+    // ---------- download ----------
+    in-out property <string> download-url: "";
+    in-out property <string> proxy-text: "";
+    in-out property <bool> env-proxy-visible: false;
+    in-out property <bool> download-running: false;
+    in-out property <string> download-progress-text: "";
+    in-out property <string> download-status: "";
+    in-out property <string> download-out-dir: "";
+
+    // ---------- modal / toast ----------
+    in-out property <bool> confirm-visible: false;
+    in-out property <string> confirm-name: "";
+    in-out property <string> confirm-path: "";
+    in-out property <bool> error-visible: false;
+    in-out property <string> error-text: "";
+
+    // ---------- callbacks ----------
+    callback toggle-sidebar();
+    callback minimize();
+    callback toggle-maximize();
+    callback close-app();
+    callback toggle-settings();
+    callback toggle-eq();
+    callback toggle-visual-mode();
+    callback open-download();
+    callback add-files();
+    callback cycle-mode();
+    callback play-index(int);
+    callback select-track(int);
+    callback queue-next(int);
+    callback import-lrc(int);
+    callback clear-lrc(int);
+    callback open-track-location(int);
+    callback remove-track(int);
+    callback delete-track(int);
+    callback confirm-delete();
+    callback cancel-delete();
     callback toggle-play();
     callback next-track();
     callback prev-track();
-    callback seek-to(float);
+    callback stop();
+    callback seek(float);
+    callback seek-preview(float);
     callback set-volume(float);
-    callback cycle-mode();
-    callback add-files();
-    callback next-theme();
-    callback toggle-auto-theme();
+    callback set-style(int);
+    callback toggle-bg-spectrum();
+    callback toggle-radial();
+    callback toggle-core-pulse();
+    callback toggle-lyrics();
+    callback toggle-peak-hold();
+    callback adjust-radial-scale(float);
+    callback select-theme(int);
+    callback select-auto-theme(bool);
+    callback reload-themes();
+    callback customize-theme();
+    callback open-data-dir();
+    callback search-changed(string);
+    callback open-context(int, float, float);
+    callback scroll-to(float);
+    callback set-band(int, float);
+    callback cycle-eq-preset(int);
+    callback toggle-eq-enabled();
+    callback reset-eq();
+    callback start-download();
+    callback cancel-download();
+    callback open-download-dir();
+    callback use-env-proxy();
+    callback set-download-url(string);
+    callback set-proxy(string);
+    callback clear-error();
 
-    // ============ background: 4-corner gradient approximation ============
-    Rectangle {
-        background: @linear-gradient(180deg, Theme.bg-top, Theme.bg-bottom);
-    }
-    Rectangle {
-        background: @linear-gradient(90deg, Theme.corner-tl 0%, #00000000 42%,
-            #00000000 58%, Theme.corner-br 100%);
+    // Global hotkeys: an always-focusable scope mirrors the egui input map.
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        init => { self.focus(); }
+        key-pressed(e) => {
+            if (e.modifiers.control && e.text == "o") {
+                root.add-files();
+                accept
+            } else if (e.text == " ") {
+                root.toggle-play();
+                accept
+            } else if (e.text == "Up") {
+                root.set-volume(-1.0);
+                accept
+            } else if (e.text == "Down") {
+                root.set-volume(-2.0);
+                accept
+            } else if (e.text == "Left") {
+                root.seek(-1.0);
+                accept
+            } else if (e.text == "Right") {
+                root.seek(-2.0);
+                accept
+            } else if (e.text == "PageUp") {
+                root.prev-track();
+                accept
+            } else if (e.text == "PageDown") {
+                root.next-track();
+                accept
+            } else if (e.text == "Escape") {
+                if (root.confirm-visible) {
+                    root.cancel-delete();
+                } else if (root.error-visible) {
+                    root.clear-error();
+                } else {
+                    root.show-settings = false;
+                    root.show-eq = false;
+                    root.show-download = false;
+                }
+                accept
+            } else {
+                reject
+            }
+        }
     }
 
-    // ============ bottom spectrum field ============
-    Rectangle {
-        visible: root.show-bg-spectrum;
-        y: parent.height * 0.62;
-        height: parent.height * 0.30;
+    // ============ stage (CPU-painted, opaque, full window) ============
+    Image {
+        source: root.stage;
+        x: 0;
+        y: 0;
         width: parent.width;
-        clip: true;
-        for bar[i] in root.bars: Rectangle {
-            x: i * (parent.width / 100);
-            width: parent.width / 100 - 1px;
-            height: max(2px, bar.len * parent.height);
-            y: parent.height - self.height;
-            background: bar.col;
-            opacity: 0.5;
-        }
+        height: parent.height;
     }
 
-    // ============ radial spectrum ring ============
-    // Baseline circle stroke.
-    Rectangle {
-        visible: root.show-radial;
-        x: root.width / 2 - root.inner-r;
-        y: root.height / 2 - root.inner-r;
-        width: root.inner-r * 2;
-        height: root.inner-r * 2;
-        border-radius: root.inner-r;
-        border-width: max(1.5px * root.scale, 1px);
-        border-color: Theme.c-ring;
-    }
-    // Expanding beat ring.
-    Rectangle {
-        visible: root.show-radial && root.pulse > 0.02;
-        opacity: root.pulse;
-        x: root.width / 2 - self.beat-r;
-        y: root.height / 2 - self.beat-r;
-        width: self.beat-r * 2;
-        height: self.beat-r * 2;
-        border-radius: self.beat-r;
-        border-width: max(1px, root.pulse * 3px * root.scale);
-        border-color: Theme.c-ring-hi;
-        property <length> beat-r: root.inner-r * (1.05 + root.beat-age * 0.45);
-    }
-    // 100 radial LED bars: up to 12 cells per bar along the radius direction.
-    // Each bar gets a full-size transparent wrapper so the inner integer-range
-    // repeat keeps window coordinates.
-    for bar in root.bars: Rectangle {
-        width: root.width;
-        height: root.height;
-        for k in 12: Rectangle {
-            visible: root.show-radial
-                && (k * 1.0 + 1.0) <= bar.len * 12;
-            width: root.cell-size;
-            height: root.cell-size;
-            x: root.width / 2
-                + bar.dx * (root.inner-r + (k * 1.0 + 0.5) * root.cell-step)
-                - self.width / 2;
-            y: root.height / 2
-                + bar.dy * (root.inner-r + (k * 1.0 + 0.5) * root.cell-step)
-                - self.height / 2;
-            background: bar.col;
-            border-radius: self.width / 2;
-        }
-    }
-    // Peak markers.
-    for bar in root.bars: Rectangle {
-        visible: root.show-radial && root.show-peaks
-            && bar.peak > bar.len + 0.012;
-        width: root.peak-size;
-        height: root.peak-size;
-        x: root.width / 2
-            + bar.dx * (root.inner-r + bar.peak * root.max-amp)
-            - self.width / 2;
-        y: root.height / 2
-            + bar.dy * (root.inner-r + bar.peak * root.max-amp)
-            - self.height / 2;
-        background: bar.col;
-        border-radius: self.width / 2;
-    }
-
-    // ============ core dial ============
-    Rectangle {
-        x: root.width / 2 - root.disc-r * root.kick-scale;
-        y: root.height / 2 - root.disc-r * root.kick-scale;
-        width: root.disc-r * 2 * root.kick-scale;
-        height: root.disc-r * 2 * root.kick-scale;
-        border-radius: root.disc-r * root.kick-scale;
-        background: Theme.c-bg-deep;
-        border-width: 1px;
-        border-color: Theme.c-line;
-    }
+    // ============ stage labels ============
     Text {
-        text: root.time-text;
-        x: 0;
-        y: root.height / 2 - root.disc-r * 0.2;
-        width: root.width;
-        horizontal-alignment: center;
-        font-size: max(9px, root.disc-r * 0.20);
-        color: Theme.c-text-hi;
-    }
-    Text {
-        text: root.status-text;
-        x: 0;
-        y: root.height / 2 + root.disc-r * 0.22;
-        width: root.width;
-        horizontal-alignment: center;
-        font-size: max(10px, root.disc-r * 0.15);
-        color: Theme.c-text-dim;
-    }
-
-    // ============ header ============
-    Text {
-        x: 18px;
-        y: 12px;
-        text: "SONADIAL";
+        x: root.stage-x + 18px;
+        y: root.stage-y + 9px;
+        text: "SPECTRUM";
         font-size: 12px;
         color: Theme.c-text-dim;
     }
     Text {
-        x: parent.width - self.width - 18px;
-        y: 12px;
-        text: root.theme-label;
+        x: root.stage-x + root.stage-w - self.width - 18px;
+        y: root.stage-y + 9px;
+        text: "FFT 1024";
         font-size: 12px;
         color: Theme.c-text-dim;
     }
-
-    // ============ lyrics (typewriter, top-left) ============
     Text {
-        visible: root.has-track;
-        x: 18px;
-        y: 40px;
+        x: root.grid-l;
+        y: root.stage-y + root.stage-h - 14px;
+        text: "20HZ";
+        font-size: 9px;
+        color: Theme.c-text-dim;
+    }
+    Text {
+        x: root.grid-cx - self.width / 2;
+        y: root.stage-y + root.stage-h - 14px;
+        text: "8KHZ";
+        font-size: 9px;
+        color: Theme.c-text-dim;
+    }
+    Text {
+        x: root.grid-r - self.width;
+        y: root.stage-y + root.stage-h - 14px;
+        text: "20HZ";
+        font-size: 9px;
+        color: Theme.c-text-dim;
+    }
+
+    // Core dial hit area (status text ± 8px): click toggles playback.
+    Rectangle {
+        x: root.stage-x + root.stage-w / 2 - 60px;
+        y: root.stage-y + root.stage-h / 2 + root.disc-r * 0.30 - 16px;
+        width: 120px;
+        height: 32px;
+        background: transparent;
+        TouchArea {
+            mouse-cursor: pointer;
+            clicked => root.toggle-play();
+        }
+    }
+
+    // ============ lyrics (typewriter, top-left of stage) ============
+    prompt := Text {
+        visible: root.show-lyrics;
+        x: root.stage-x + 18px;
+        y: root.stage-y + 42px;
         text: ">";
         font-size: 16px;
         color: root.lyric-active ? Theme.c-text : Theme.c-text-dim;
     }
-    Rectangle {
-        visible: root.has-track;
-        x: 40px;
-        y: 40px;
-        height: 20px;
-        width: parent.width - 58px;
-        clip: true;
-        Text {
-            y: (parent.height - self.height) / 2;
-            text: root.lyric-current;
-            font-size: 16px;
-            font-family: "Fusion Pixel 12px Mono latin";
-            color: root.lyric-active ? Theme.c-text-hi : Theme.c-text-dim;
-        }
+    Text {
+        visible: root.show-lyrics;
+        x: prompt.x + prompt.preferred-width + 8px;
+        y: root.stage-y + 42px;
+        width: root.stage-x + root.stage-w - 18px - self.x;
+        text: root.lyric-current;
+        font-family: "Fusion Pixel 12px Mono latin";
+        font-size: 16px;
+        color: root.lyric-active ? Theme.c-text-hi : Theme.c-text-dim;
+        overflow: elide;
     }
     Text {
-        visible: root.has-track;
-        x: 40px;
-        y: 68px;
-        width: parent.width - 58px;
+        visible: root.show-lyrics;
+        x: prompt.x + prompt.preferred-width + 8px;
+        y: root.stage-y + 70px;
+        width: root.stage-x + root.stage-w - 18px - self.x;
         text: root.lyric-next;
-        font-size: 12px;
         font-family: "Fusion Pixel 12px Mono latin";
+        font-size: 12px;
         color: Theme.c-text-dim;
         overflow: elide;
     }
 
-    // ============ bottom bar ============
+    // ============ top bar ============
     Rectangle {
-        y: parent.height - 48px;
+        y: 0;
         width: parent.width;
-        height: 48px;
-        // progress strip
+        height: 44px;
         Rectangle {
-            y: 0;
-            height: 2px;
+            y: parent.height - 1px;
             width: parent.width;
+            height: 1px;
             background: Theme.c-line;
-            opacity: 0.55;
+        }
+        InkBtn {
+            x: 10px;
+            y: 11px;
+            width: 30px;
+            size: 13;
+            label: "[=]";
+            clicked => root.toggle-sidebar();
+        }
+        Text {
+            x: 50px;
+            height: parent.height;
+            vertical-alignment: center;
+            text: "sonadial-player";
+            font-size: 15px;
+            color: Theme.c-text-hi;
+        }
+        WindowMoveArea {
+            x: 184px;
+            y: 4px;
+            width: parent.width - 184px - 420px;
+            height: parent.height - 8px;
+        }
+        InkBtn {
+            x: parent.width - 10px - 32px;
+            y: 11px;
+            width: 32px;
+            size: 13;
+            label: "[x]";
+            clicked => root.close-app();
+        }
+        InkBtn {
+            x: parent.width - 10px - 32px - 36px;
+            y: 11px;
+            width: 32px;
+            size: 13;
+            label: "[]";
+            clicked => root.toggle-maximize();
+        }
+        InkBtn {
+            x: parent.width - 10px - 32px - 72px;
+            y: 11px;
+            width: 32px;
+            size: 13;
+            label: "-";
+            clicked => root.minimize();
+        }
+        InkBtn {
+            x: parent.width - 10px - 32px - 72px - 42px - 38px;
+            y: 11px;
+            width: 38px;
+            label: "SYS";
+            clicked => root.toggle-settings();
+        }
+        InkBtn {
+            x: parent.width - 10px - 32px - 72px - 42px - 38px - 38px - 34px;
+            y: 11px;
+            width: 34px;
+            label: "EQ";
+            clicked => root.toggle-eq();
+        }
+        InkBtn {
+            x: parent.width - 10px - 32px - 72px - 42px - 38px - 38px - 34px - 62px - 58px;
+            y: 11px;
+            width: 58px;
+            label: "[MODE]";
+            clicked => root.toggle-visual-mode();
+        }
+    }
+
+    // ============ sidebar ============
+    Rectangle {
+        x: 0;
+        y: 44px;
+        width: root.sidebar-w;
+        height: parent.height - 44px - 124px;
+        visible: root.sidebar-open;
+        Rectangle {
+            x: parent.width - 1px;
+            width: 1px;
+            height: parent.height;
+            background: Theme.c-line;
+        }
+        Text {
+            x: 14px;
+            y: 6px;
+            text: "LIBRARY";
+            font-size: 14px;
+            color: Theme.c-text-hi;
+        }
+        Text {
+            x: parent.width - self.width - 14px;
+            y: 8px;
+            text: (root.track-count < 10 ? "0" : "") + root.track-count + " TRACKS";
+            font-size: 12px;
+            color: Theme.c-text-dim;
+        }
+        Text {
+            x: 14px;
+            y: 34px;
+            height: 20px;
+            vertical-alignment: center;
+            text: "find:";
+            font-size: 13px;
+            color: Theme.c-text-dim;
+        }
+        TextInput {
+            x: 62px;
+            y: 34px;
+            width: parent.width - 76px;
+            height: 20px;
+            single-line: true;
+            font-size: 13px;
+            color: Theme.c-text-hi;
+            vertical-alignment: center;
+            text <=> root.search-text;
+            edited => root.search-changed(root.search-text);
+        }
+        Text {
+            visible: root.search-text == "";
+            x: 62px;
+            y: 34px;
+            height: 20px;
+            vertical-alignment: center;
+            text: "title...";
+            font-size: 13px;
+            color: Theme.c-text-dim.with-alpha(0.55);
         }
         Rectangle {
-            y: 0;
-            height: 2px;
-            width: root.progress * parent.width;
-            background: Theme.c-text-hi;
-        }
-        TouchArea {
-            y: -6px;
-            height: 14px;
-            width: parent.width;
-            mouse-cursor: pointer;
-            clicked => {
-                if (parent.width > 0px) {
-                    root.seek-to(self.mouse-x / parent.width);
-                }
-            }
-        }
-        HorizontalLayout {
-            y: 12px;
-            height: 26px;
-            padding-left: 14px;
-            padding-right: 14px;
-            spacing: 10px;
-            Btn {
-                label: "ADD";
+            x: 14px;
+            y: 62px;
+            width: 74px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: "[ add ]";
                 clicked => root.add-files();
             }
-            Btn {
-                label: root.mode-label;
-                on: true;
+        }
+        Rectangle {
+            x: 88px;
+            y: 62px;
+            width: 132px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: "[ mode: " + root.mode-short + " ]";
                 clicked => root.cycle-mode();
             }
-            Btn {
-                label: "THEME";
-                clicked => root.next-theme();
+        }
+        Rectangle {
+            x: 220px;
+            y: 62px;
+            width: 90px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: "[ download ]";
+                clicked => root.open-download();
             }
-            Btn {
-                label: "AUTO";
-                clicked => root.toggle-auto-theme();
-            }
-            Rectangle { horizontal-stretch: 1; }
-            Btn {
-                label: "<<";
-                clicked => root.prev-track();
-            }
-            Btn {
-                label: root.paused ? "PLAY" : "PAUSE";
-                accent: true;
-                clicked => root.toggle-play();
-            }
-            Btn {
-                label: ">>";
-                clicked => root.next-track();
-            }
-            Rectangle { horizontal-stretch: 1; }
-            Text {
-                text: root.time-text;
-                font-size: 12px;
-                color: Theme.c-text-dim;
-                vertical-alignment: center;
-            }
-            // volume strip
-            Rectangle {
-                width: 130px;
-                Rectangle {
-                    y: 12px;
-                    height: 2px;
-                    width: parent.width;
-                    background: Theme.c-line;
-                    opacity: 0.6;
-                }
-                Rectangle {
-                    y: 12px;
-                    height: 2px;
-                    width: root.volume * parent.width;
-                    background: Theme.c-text-hi;
-                }
-                TouchArea {
+        }
+        Rectangle {
+            x: 14px;
+            y: 95px;
+            width: parent.width - 28px;
+            height: 1px;
+            background: Theme.c-line;
+        }
+        // Track list: manual clip + offset so the custom TUI scrollbar stays exact.
+        property <length> list-top: 103px;
+        property <length> list-h: self.height - 103px - 8px;
+        Rectangle {
+            x: 8px;
+            y: list-top;
+            width: parent.width - 22px;
+            height: list-h;
+            clip: true;
+            for row[i] in root.tracks: Rectangle {
+                y: i * 26px - root.scroll-y * 1px;
+                width: parent.width;
+                height: 26px;
+                background: row.selected ? Theme.c-text-hi : transparent;
+                border-width: row.focused ? 1px : 0px;
+                border-color: row.selected ? Theme.c-bg : Theme.c-text-hi;
+                ta := TouchArea {
                     mouse-cursor: pointer;
-                    clicked => {
-                        if (parent.width > 0px) {
-                            root.set-volume(self.mouse-x / parent.width);
+                    clicked => root.select-track(row.index);
+                    double-clicked => root.play-index(row.index);
+                    pointer-event(e) => {
+                        if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                            root.open-context(row.index, (8px + self.mouse-x) / 1px, (103px + i * 26px - root.scroll-y * 1px + 26px) / 1px);
                         }
                     }
                 }
+                Text {
+                    x: 4px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: (row.selected ? "> " : "   ")
+                        + (row.index + 1 >= 10 ? row.index + 1 : "0" + (row.index + 1))
+                        + (row.playing ? "*" : " ") + (row.has-lrc ? "L" : " ");
+                    font-size: 13px;
+                    color: row.selected ? Theme.c-bg : Theme.c-text-dim;
+                }
+                Text {
+                    x: 58px;
+                    width: parent.width - 58px - 84px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: row.title;
+                    font-family: "Fusion Pixel 12px Mono latin";
+                    font-size: 13px;
+                    color: row.selected ? Theme.c-bg : Theme.c-text;
+                    overflow: elide;
+                }
+                Text {
+                    x: parent.width - 80px;
+                    width: 68px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    text: row.meta;
+                    font-size: 12px;
+                    color: row.selected ? Theme.c-text-dim : Theme.c-text-dim;
+                }
             }
+            if (root.tracks.length == 0): Rectangle {
+                width: parent.width;
+                height: list-h;
+                Text {
+                    x: 6px;
+                    y: 12px;
+                    text: "no tracks";
+                    font-size: 13px;
+                    color: Theme.c-text-dim;
+                }
+                Text {
+                    x: 6px;
+                    y: 36px;
+                    text: "drop audio or ctrl+o";
+                    font-size: 12px;
+                    color: Theme.c-text-dim;
+                }
+            }
+        }
+        // TUI scrollbar: '-' track, '#' thumb, '@' on the current row.
+        property <bool> near: probe.has-hover || thumbdrag.has-hover || thumbdrag.pressed;
+        property <int> cells: Math.max(1, Math.floor(list-h / 13px));
+        property <float> frac: root.scroll-max > 0.5
+            ? Math.min(1.0, Math.max(0.0, root.scroll-y / root.scroll-max)) : 0.0;
+        property <int> thumb-cells: Math.min(cells,
+            Math.max(1, Math.round(list-h / Math.max(26px, root.tracks.length * 26px) * cells)));
+        property <int> thumb-start: Math.max(0, Math.min(self.cells - self.thumb-cells,
+            Math.round((self.cells - self.thumb-cells) * frac)));
+        for i in cells: Text {
+            x: parent.width - 12px;
+            width: 12px;
+            height: 13px;
+            y: list-top + i * 13px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+            text: root.current-cell == i ? "@"
+                : (i >= thumb-start && i < thumb-start + thumb-cells ? "#" : "-");
+            font-size: 12px;
+            color: root.current-cell == i ? Theme.c-text-hi
+                : (i >= thumb-start && i < thumb-start + thumb-cells
+                    ? (root.scroll-active ? Theme.c-text-hi
+                        : (near ? Theme.c-text-dim : Theme.c-text-dim.with-alpha(0.35)))
+                    : Theme.c-text-dim.with-alpha(near ? 0.43 : 0.14));
+        }
+        thumbdrag := TouchArea {
+            x: parent.width - 14px;
+            y: 103px;
+            width: 14px;
+            height: list-h;
+            mouse-cursor: ns-resize;
+            moved => {
+                root.scroll-active = true;
+                if (root.scroll-max > 0.5) {
+                    root.scroll-to(Math.min(1.0, Math.max(0.0, self.mouse-y / list-h)) * root.scroll-max);
+                }
+            }
+            pointer-event(e) => {
+                root.scroll-active = e.kind == PointerEventKind.down;
+                if (e.kind == PointerEventKind.down && root.scroll-max > 0.5) {
+                    root.scroll-to(Math.min(1.0, Math.max(0.0, self.mouse-y / list-h)) * root.scroll-max);
+                }
+            }
+        }
+        probe := TouchArea {
+            x: parent.width - 42px;
+            y: 103px;
+            width: 28px;
+            height: list-h;
+        }
+        // Right-click context menu (positioned over the clicked row).
+        if (root.context-index >= 0): TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.context-index = -1; }
+        }
+        if (root.context-index >= 0): Rectangle {
+            x: Math.min(root.context-x, parent.width - 236px);
+            y: Math.min(root.context-y, parent.height - 230px);
+            width: 232px;
+            background: Theme.c-bg;
+            border-width: 1px;
+            border-color: Theme.c-text-hi;
+            Rectangle {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: 28px;
+                Text {
+                    x: 8px;
+                    y: 0px;
+                    width: parent.width - 16px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: "  " + root.context-title;
+                    font-size: 12px;
+                    color: Theme.c-text-hi;
+                    overflow: elide;
+                }
+                Rectangle {
+                    y: parent.height - 1px;
+                    width: parent.width;
+                    height: 1px;
+                    background: Theme.c-line;
+                }
+            }
+            Rectangle {
+                x: 1px;
+                y: 32px;
+                width: parent.width - 2px;
+                height: 152px;
+                MenuRow {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    label: "PLAY";
+                    clicked => root.play-index(root.context-index);
+                }
+                MenuRow {
+                    x: 0px;
+                    y: 24px;
+                    width: parent.width;
+                    label: "PLAY NEXT";
+                    clicked => root.queue-next(root.context-index);
+                }
+                MenuRow {
+                    x: 0px;
+                    y: 48px;
+                    width: parent.width;
+                    label: root.context-has-lrc ? "REPLACE LRC..." : "IMPORT LRC...";
+                    clicked => root.import-lrc(root.context-index);
+                }
+                if (root.context-has-lrc): MenuRow {
+                    x: 0px;
+                    y: 72px;
+                    width: parent.width;
+                    label: "CLEAR LRC";
+                    clicked => root.clear-lrc(root.context-index);
+                }
+                MenuRow {
+                    x: 0px;
+                    y: root.context-has-lrc ? 96px : 72px;
+                    width: parent.width;
+                    label: "OPEN LOCATION";
+                    clicked => root.open-track-location(root.context-index);
+                }
+                Rectangle {
+                    y: root.context-has-lrc ? 122px : 98px;
+                    x: 8px;
+                    width: parent.width - 16px;
+                    height: 1px;
+                    background: Theme.c-line;
+                }
+                MenuRow {
+                    x: 0px;
+                    y: root.context-has-lrc ? 126px : 102px;
+                    width: parent.width;
+                    label: "REMOVE FROM LIST";
+                    clicked => root.remove-track(root.context-index);
+                }
+                MenuRow {
+                    x: 0px;
+                    y: root.context-has-lrc ? 150px : 126px;
+                    width: parent.width;
+                    label: "DELETE FILE...";
+                    danger: true;
+                    clicked => root.delete-track(root.context-index);
+                }
+            }
+            // Click-away catcher.
+            TouchArea { }
+        }
+    }
+
+    // ============ dock ============
+    Rectangle {
+        y: parent.height - 124px;
+        width: parent.width;
+        height: 124px;
+        Rectangle {
+            y: 0;
+            width: parent.width;
+            height: 1px;
+            background: Theme.c-line;
+        }
+        Text {
+            x: 16px;
+            y: 18px;
+            width: parent.width * 0.55;
+            text: root.dock-title;
+            font-family: "Fusion Pixel 12px Mono latin";
+            font-size: 15px;
+            color: root.dock-title-live ? Theme.c-text-hi : Theme.c-text-dim;
+            overflow: elide;
+        }
+        Text {
+            x: 16px;
+            y: 38px;
+            text: root.meta-prefix + root.meta-output;
+            font-size: 12px;
+            color: Theme.c-text-dim;
+        }
+        Text {
+            x: parent.width - self.width - 16px;
+            y: 38px;
+            text: root.mode-text;
+            font-size: 12px;
+            color: Theme.c-text-dim;
+        }
+        // ASCII seek bar: [###---] time — text boxes are 20px tall, centred ink.
+        property <length> bar-y: 54px;
+        property <length> track-left: 16px + 13px;
+        Text {
+            x: 16px;
+            y: bar-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: "[";
+            font-size: 13px;
+            color: Theme.c-text-dim;
+        }
+        Text {
+            x: track-left;
+            y: bar-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: root.seek-filled-str;
+            font-size: 13px;
+            color: Theme.c-text-hi;
+        }
+        Text {
+            x: track-left + root.seek-filled * 13px;
+            y: bar-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: root.seek-rest-str;
+            font-size: 13px;
+            color: Theme.c-text-dim.with-alpha(0.43);
+        }
+        Text {
+            x: track-left + root.seek-cells * 13px;
+            y: bar-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: "]";
+            font-size: 13px;
+            color: Theme.c-text-dim;
+        }
+        Text {
+            x: track-left + root.seek-cells * 13px + 10px;
+            y: bar-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: root.time-text;
+            font-size: 13px;
+            color: Theme.c-text-dim;
+        }
+        TouchArea {
+            x: 16px;
+            y: bar-y;
+            width: root.seek-cells * 13px + 26px;
+            height: 20px;
+            mouse-cursor: pointer;
+            moved => {
+                root.seek-preview(Math.min(1.0, Math.max(0.0, (self.mouse-x - 13px) / (root.seek-cells * 13px))));
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.up) {
+                    root.seek(Math.min(1.0, Math.max(0.0, (self.mouse-x - 13px) / (root.seek-cells * 13px))));
+                }
+            }
+        }
+        // ASCII volume: VOL [####----] nnn%
+        property <length> vol-y: 80px;
+        Text {
+            x: 16px;
+            y: vol-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: "VOL [";
+            font-size: 12px;
+            color: Theme.c-text-dim;
+        }
+        Text {
+            x: 16px + 60px;
+            y: vol-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: root.vol-fill-str;
+            font-size: 12px;
+            color: Theme.c-text;
+        }
+        Text {
+            x: 16px + 60px + root.vol-filled * 12px;
+            y: vol-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: root.vol-rest-str;
+            font-size: 12px;
+            color: Theme.c-text-dim.with-alpha(0.43);
+        }
+        Text {
+            x: 16px + 252px;
+            y: vol-y;
+            height: 20px;
+            vertical-alignment: center;
+            text: "] " + root.vol-pct;
+            font-size: 12px;
+            color: Theme.c-text-dim;
+        }
+        TouchArea {
+            x: 16px;
+            y: vol-y;
+            width: 324px;
+            height: 20px;
+            mouse-cursor: pointer;
+            moved => {
+                root.set-volume(Math.min(1.0, Math.max(0.0, self.mouse-x / 324px)) * 1.25);
+            }
+            pointer-event(e) => {
+                if (e.kind == PointerEventKind.down) {
+                    root.set-volume(Math.min(1.0, Math.max(0.0, self.mouse-x / 324px)) * 1.25);
+                }
+            }
+        }
+        // Transport buttons, centred like the egui dock.
+        HorizontalLayout {
+            x: (parent.width - 310px) / 2;
+            y: parent.height - 31px;
+            width: 310px;
+            height: 22px;
+            spacing: 8px;
+            InkBtn {
+                width: 64px;
+                label: "< PREV";
+                clicked => root.prev-track();
+            }
+            InkBtn {
+                width: 64px;
+                label: root.play-label;
+                clicked => root.toggle-play();
+            }
+            InkBtn {
+                width: 58px;
+                label: "STOP";
+                clicked => root.stop();
+            }
+            InkBtn {
+                width: 64px;
+                label: "NEXT >";
+                clicked => root.next-track();
+            }
+        }
+    }
+
+    // ============ SYSTEM overlay ============
+    if (root.show-settings): Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 470px;
+        height: 440px;
+        background: Theme.c-bg;
+        border-width: 1px;
+        border-color: Theme.c-text-hi;
+        HorizontalLayout {
+            x: 20px;
+            y: 14px;
+            width: parent.width - 74px;
+            height: 22px;
+            spacing: 0px;
+            TabBtn {
+                width: 118px;
+                label: "[ SYSTEM ]";
+                active: root.settings-page == 0;
+                clicked => { root.settings-page = 0; }
+            }
+            TabBtn {
+                width: 118px;
+                label: "[ VISUALS ]";
+                active: root.settings-page == 1;
+                clicked => { root.settings-page = 1; }
+            }
+            TabBtn {
+                width: 118px;
+                label: "[ THEME ]";
+                active: root.settings-page == 2;
+                clicked => { root.settings-page = 2; }
+            }
+        }
+        CloseX {
+            x: parent.width - 54px;
+            y: 13px;
+            clicked => { root.show-settings = false; }
+        }
+        if (root.settings-page == 0): Rectangle {
+            x: 20px;
+            y: 48px;
+            width: parent.width - 40px;
+            height: parent.height - 68px;
+            Text {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                text: "SONADIAL PLAYER";
+                font-size: 24px;
+                color: Theme.c-text-hi;
+            }
+            Text {
+                x: 0px;
+                y: 34px;
+                text: "v0.1 / " + root.track-count + " TRACKS / " + root.mode-long;
+                font-size: 12px;
+                color: Theme.c-text-dim;
+            }
+            Text {
+                x: 0px;
+                y: 58px;
+                text: "OUTPUT  " + root.out-label;
+                font-size: 12px;
+                color: Theme.c-text;
+                overflow: elide;
+            }
+            Rectangle {
+                x: 0px;
+                y: 78px;
+                width: parent.width;
+                height: 1px;
+                background: Theme.c-line;
+            }
+            Text {
+                x: 0px;
+                y: 84px;
+                text: "STATE  " + root.state-path;
+                font-size: 12px;
+                color: Theme.c-text;
+                overflow: elide;
+            }
+            Text {
+                x: 0px;
+                y: 110px;
+                text: "SHORTCUTS";
+                font-size: 12px;
+                color: Theme.c-text-dim;
+            }
+            for sc in root.shortcuts: Rectangle {
+                x: 0px;
+                y: 132px + sc.index * 18px;
+                width: parent.width;
+                height: 18px;
+                Text {
+                    width: 150px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: sc.keys;
+                    font-size: 12px;
+                    color: Theme.c-text-hi;
+                }
+                Text {
+                    x: 150px;
+                    width: parent.width - 150px;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: sc.desc;
+                    font-size: 12px;
+                    color: Theme.c-text;
+                    overflow: elide;
+                }
+            }
+            TuiBtn {
+                x: 0px;
+                y: parent.height - 26px;
+                width: 150px;
+                label: "[ open data dir ]";
+                clicked => root.open-data-dir();
+            }
+        }
+        if (root.settings-page == 1): Rectangle {
+            x: 20px;
+            y: 48px;
+            width: parent.width - 40px;
+            height: parent.height - 68px;
+            Text {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                text: "VISUAL EFFECTS";
+                font-size: 24px;
+                color: Theme.c-text-hi;
+            }
+            Text {
+                x: 0px;
+                y: 38px;
+                text: "MODE";
+                font-size: 12px;
+                color: Theme.c-text-dim;
+            }
+            Rectangle {
+                x: 0px;
+                y: 56px;
+                width: (parent.width - 16px) / 3;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.visual-style == 0 ? "[ DEFAULT ON ]" : "[ DEFAULT OFF ]";
+                    clicked => root.set-style(0);
+                }
+            }
+            Rectangle {
+                x: (parent.width - 16px) / 3 + 8px;
+                y: 56px;
+                width: (parent.width - 16px) / 3;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.visual-style == 1 ? "[ DOT MATRIX ON ]" : "[ DOT MATRIX OFF ]";
+                    clicked => root.set-style(1);
+                }
+            }
+            Rectangle {
+                x: ((parent.width - 16px) / 3) * 2 + 16px;
+                y: 56px;
+                width: (parent.width - 16px) / 3;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.visual-style == 2 ? "[ PIANO (DEV) ON ]" : "[ PIANO (DEV) OFF ]";
+                    clicked => root.set-style(2);
+                }
+            }
+            Text {
+                x: 0px;
+                y: 92px;
+                text: "LAYERS";
+                font-size: 12px;
+                color: Theme.c-text-dim;
+            }
+            Rectangle {
+                x: 0;
+                y: 110px;
+                width: (parent.width - 8px) / 2;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.show-bg-spectrum ? "[ BG SPECTRUM ON ]" : "[ BG SPECTRUM OFF ]";
+                    clicked => root.toggle-bg-spectrum();
+                }
+            }
+            Rectangle {
+                x: (parent.width - 8px) / 2 + 8px;
+                y: 110px;
+                width: (parent.width - 8px) / 2;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.show-radial ? "[ RADIAL ON ]" : "[ RADIAL OFF ]";
+                    clicked => root.toggle-radial();
+                }
+            }
+            Rectangle {
+                x: 0;
+                y: 136px;
+                width: (parent.width - 8px) / 2;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.show-core-pulse ? "[ CORE PULSE ON ]" : "[ CORE PULSE OFF ]";
+                    clicked => root.toggle-core-pulse();
+                }
+            }
+            Rectangle {
+                x: (parent.width - 8px) / 2 + 8px;
+                y: 136px;
+                width: (parent.width - 8px) / 2;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.show-lyrics ? "[ LYRICS ON ]" : "[ LYRICS OFF ]";
+                    clicked => root.toggle-lyrics();
+                }
+            }
+            Rectangle {
+                x: 0;
+                y: 162px;
+                width: (parent.width - 8px) / 2;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.peak-hold ? "[ PEAK HOLD ON ]" : "[ PEAK HOLD OFF ]";
+                    clicked => root.toggle-peak-hold();
+                }
+            }
+            Text {
+                x: 0px;
+                y: 198px;
+                text: "PARAMETERS";
+                font-size: 12px;
+                color: Theme.c-text-dim;
+            }
+            Text {
+                x: 0px;
+                y: 216px;
+                text: "RADIAL SIZE";
+                font-size: 12px;
+                color: Theme.c-text-dim;
+                height: 22px;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                x: 100px;
+                y: 216px;
+                width: 34px;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: "[-]";
+                    clicked => root.adjust-radial-scale(-0.05);
+                }
+            }
+            Text {
+                x: 142px;
+                y: 216px;
+                width: 48px;
+                text: Math.round(root.radial-scale * 100.0) + "%";
+                font-size: 12px;
+                color: Theme.c-text;
+                height: 22px;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                x: 198px;
+                y: 216px;
+                width: 34px;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: "[+]";
+                    clicked => root.adjust-radial-scale(0.05);
+                }
+            }
+        }
+        if (root.settings-page == 2): Rectangle {
+            x: 20px;
+            y: 48px;
+            width: parent.width - 40px;
+            height: parent.height - 68px;
+            clip: true;
+            Text {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                text: "THEME";
+                font-size: 24px;
+                color: Theme.c-text-hi;
+            }
+            Text {
+                x: 0px;
+                y: 34px;
+                text: root.theme-current-line;
+                font-size: 12px;
+                color: Theme.c-text-dim;
+            }
+            if (root.theme-auto-status != ""): Text {
+                x: 0px;
+                y: 52px;
+                text: root.theme-auto-status;
+                font-size: 12px;
+                color: Theme.c-text-dim;
+            }
+            Rectangle {
+                x: 0;
+                y: root.theme-auto-status == "" ? 66px : 76px;
+                width: 96px;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: "[ RELOAD ]";
+                    clicked => root.reload-themes();
+                }
+            }
+            Rectangle {
+                x: 104px;
+                y: root.theme-auto-status == "" ? 66px : 76px;
+                width: 120px;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: root.theme-customize-label;
+                    clicked => root.customize-theme();
+                }
+            }
+            if (root.theme-load-error != ""): Text {
+                x: 0px;
+                y: root.theme-auto-status == "" ? 96px : 106px;
+                width: parent.width;
+                text: root.theme-load-error;
+                font-size: 12px;
+                color: Theme.c-danger;
+                overflow: elide;
+            }
+            if (root.theme-warnings != ""): Text {
+                x: 0px;
+                y: root.theme-auto-status == "" ? 114px : 124px;
+                width: parent.width;
+                text: root.theme-warnings;
+                font-size: 12px;
+                color: Theme.c-danger;
+                overflow: elide;
+            }
+            Text {
+                x: 0px;
+                y: 140px;
+                text: "AUTO";
+                font-size: 12px;
+                color: Theme.c-text-dim;
+            }
+            Rectangle {
+                x: 0;
+                y: 158px;
+                width: (parent.width - 8px) / 2;
+                height: 28px;
+                for chip in root.auto-chips: ChipBtn {
+                    width: (parent.width - 8px) / 2;
+                    label: chip.name;
+                    grad-a: chip.grad-a;
+                    grad-b: chip.grad-b;
+                    fg: chip.fg;
+                    dim: chip.dim;
+                    active: chip.active;
+                    clicked => root.select-auto-theme(chip.dark);
+                }
+            }
+            for group in root.theme-groups: Rectangle {
+                x: 0px;
+                y: 196px + group.offset * 34px;
+                width: parent.width;
+                height: 30px + Math.ceil(group.chips.length / 4) * 34px;
+                Text {
+                    text: group.label;
+                    font-size: 12px;
+                    color: Theme.c-text-dim;
+                }
+                for chip in group.chips: ChipBtn {
+                    x: chip.col * ((parent.width - 24px) / 4 + 8px);
+                    y: 22px + chip.row * 34px;
+                    width: (parent.width - 24px) / 4;
+                    label: chip.name;
+                    grad-a: chip.grad-a;
+                    grad-b: chip.grad-b;
+                    fg: chip.fg;
+                    dim: chip.dim;
+                    active: chip.active;
+                    clicked => root.select-theme(chip.index);
+                }
+            }
+            Text {
+                x: 0px;
+                y: parent.height - 20px;
+                text: "FILE  " + root.theme-file-path;
+                font-size: 10px;
+                color: Theme.c-text-dim;
+                overflow: elide;
+            }
+        }
+    }
+
+    // ============ EQ overlay ============
+    if (root.show-eq): Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 700px;
+        height: 420px;
+        background: Theme.c-bg;
+        border-width: 1px;
+        border-color: Theme.c-text-hi;
+        Text {
+            x: 20px;
+            y: 14px;
+            text: "GRAPHIC EQUALIZER";
+            font-size: 22px;
+            color: Theme.c-text-hi;
+        }
+        CloseX {
+            x: parent.width - 54px;
+            y: 14px;
+            clicked => { root.show-eq = false; }
+        }
+        Rectangle {
+            x: 20px;
+            y: 48px;
+            width: 42px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: "[ < ]";
+                clicked => root.cycle-eq-preset(-1);
+            }
+        }
+        Text {
+            x: 70px;
+            y: 48px;
+            width: 130px;
+            height: 22px;
+            vertical-alignment: center;
+            text: "PRESET: " + root.eq-preset-name;
+            font-size: 12px;
+            color: Theme.c-text-hi;
+        }
+        Rectangle {
+            x: 208px;
+            y: 48px;
+            width: 42px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: "[ > ]";
+                clicked => root.cycle-eq-preset(1);
+            }
+        }
+        Rectangle {
+            x: 258px;
+            y: 48px;
+            width: 120px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: root.eq-enabled ? "[ ENABLED ON ]" : "[ ENABLED OFF ]";
+                clicked => root.toggle-eq-enabled();
+            }
+        }
+        Rectangle {
+            x: 386px;
+            y: 48px;
+            width: 84px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: "[ RESET ]";
+                clicked => root.reset-eq();
+            }
+        }
+        Rectangle {
+            x: 20px;
+            y: 82px;
+            width: parent.width - 40px;
+            height: 280px;
+            Rectangle {
+                y: (parent.height - 46px) / 2;
+                width: parent.width;
+                height: 1px;
+                background: Theme.c-line.with-alpha(0.59);
+            }
+            Rectangle {
+                x: 4px;
+                y: 22px;
+                width: 1px;
+                height: parent.height - 46px;
+                background: Theme.c-line;
+            }
+            Rectangle {
+                x: parent.width - 5px;
+                y: 22px;
+                width: 1px;
+                height: parent.height - 46px;
+                background: Theme.c-line;
+            }
+            for band[bi] in root.eq-bands: Rectangle {
+                x: 4px + bi * ((parent.width - 8px) / 10);
+                width: (parent.width - 8px) / 10;
+                y: 22px;
+                height: parent.height - 46px;
+                property <length> seg-h: (parent.height - 46px) / 24;
+                Text {
+                    y: 2px;
+                    width: parent.width;
+                    text: band.label;
+                    font-size: 10px;
+                    color: root.eq-enabled ? Theme.c-text : Theme.c-text-dim;
+                    horizontal-alignment: center;
+                }
+                Text {
+                    y: parent.height - 18px;
+                    width: parent.width;
+                    text: band.freq;
+                    font-size: 10px;
+                    color: Theme.c-text-dim;
+                    horizontal-alignment: center;
+                }
+                for seg[si] in 24: Rectangle {
+                    property <float> level: si < 12 ? (11.0 - si) : -(si - 11.0);
+                    property <bool> lit: band.gain > 0.0 ? band.gain >= self.level - 0.25
+                        : (band.gain < 0.0 ? band.gain <= self.level + 0.5 : false);
+                    x: (parent.width - parent.width * 0.34) / 2;
+                    y: 22px + si * parent.seg-h + 1px;
+                    height: parent.seg-h - 2px;
+                    width: parent.width * 0.34;
+                    background: self.lit ? (si < 12 ? Theme.c-text : Theme.c-text-hi)
+                        : Theme.c-line.with-alpha(0.24);
+                }
+                TouchArea {
+                    mouse-cursor: ns-resize;
+                    moved => {
+                        root.set-band(bi, Math.max(-12.0, Math.min(12.0,
+                            Math.round((0.5 - self.mouse-y / self.height) * 48.0) / 2.0)));
+                    }
+                }
+            }
+        }
+        Text {
+            x: 20px;
+            y: parent.height - 36px;
+            text: root.eq-hint;
+            font-size: 12px;
+            color: Theme.c-text-dim;
+        }
+    }
+
+    // ============ BILIBILI overlay ============
+    if (root.show-download): Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 560px;
+        height: 420px;
+        background: Theme.c-bg;
+        border-width: 1px;
+        border-color: Theme.c-text-hi;
+        CloseX {
+            x: parent.width - 54px;
+            y: 14px;
+            clicked => { root.show-download = false; }
+        }
+        Text {
+            x: 20px;
+            y: 44px;
+            text: "Download & Decode";
+            font-size: 24px;
+            color: Theme.c-text-hi;
+        }
+        Rectangle {
+            x: 20px;
+            y: 84px;
+            width: parent.width - 40px;
+            height: 28px;
+            background: Theme.c-text-hi.with-alpha(0.92);
+            TextInput {
+                x: 8px;
+                width: parent.width - 16px;
+                height: parent.height;
+                single-line: true;
+                font-family: "Fusion Pixel 12px Mono latin";
+                font-size: 13px;
+                color: Theme.c-bg-deep;
+                vertical-alignment: center;
+                text <=> root.download-url;
+                edited => root.set-download-url(root.download-url);
+                accepted => root.start-download();
+            }
+            Text {
+                visible: root.download-url == "";
+                x: 8px;
+                height: parent.height;
+                vertical-alignment: center;
+                text: "https://www.bilibili.com/video/BV...";
+                font-family: "Fusion Pixel 12px Mono latin";
+                font-size: 13px;
+                color: Theme.c-bg-deep.with-alpha(0.45);
+            }
+        }
+        Text {
+            x: 20px;
+            y: 122px;
+            text: "PROXY";
+            font-size: 10px;
+            color: Theme.c-text-dim;
+        }
+        TextInput {
+            x: 20px;
+            y: 136px;
+            width: parent.width - (root.env-proxy-visible ? 92px : 40px);
+            height: 20px;
+            single-line: true;
+            font-size: 11px;
+            color: Theme.c-text;
+            vertical-alignment: center;
+            text <=> root.proxy-text;
+            edited => root.set-proxy(root.proxy-text);
+        }
+        Text {
+            visible: root.proxy-text == "";
+            x: 20px;
+            y: 136px;
+            height: 20px;
+            vertical-alignment: center;
+            text: "DIRECT / 127.0.0.1:7890";
+            font-size: 11px;
+            color: Theme.c-text-dim.with-alpha(0.55);
+        }
+        TuiBtn {
+            visible: root.env-proxy-visible && root.proxy-text == "";
+            x: parent.width - 72px;
+            y: 135px;
+            width: 52px;
+            label: "[ ENV ]";
+            clicked => root.use-env-proxy();
+        }
+        Rectangle {
+            x: 20px;
+            y: 168px;
+            width: root.download-running ? 110px : 120px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: root.download-running ? "[ CANCEL ]" : "[ DOWNLOAD ]";
+                clicked => root.download-running ? root.cancel-download() : root.start-download();
+            }
+        }
+        Rectangle {
+            x: 150px;
+            y: 168px;
+            width: 112px;
+            height: 22px;
+            TuiBtn {
+                width: parent.width;
+                label: "[ OPEN DIR ]";
+                clicked => root.open-download-dir();
+            }
+        }
+        if (root.download-progress-text != ""): Text {
+            x: 20px;
+            y: 202px;
+            text: root.download-progress-text;
+            font-size: 12px;
+            color: Theme.c-text-hi;
+        }
+        if (root.download-status != ""): Text {
+            x: 20px;
+            y: 226px;
+            width: parent.width - 40px;
+            text: root.download-status;
+            font-size: 12px;
+            color: Theme.c-text;
+            overflow: elide;
+        }
+        Text {
+            x: 20px;
+            y: parent.height - 58px;
+            width: parent.width - 40px;
+            text: "OUT  " + root.download-out-dir;
+            font-size: 10px;
+            color: Theme.c-text-dim;
+            overflow: elide;
+        }
+        Text {
+            x: 20px;
+            y: parent.height - 40px;
+            text: "AAC / M4A  |  FFMPEG OPTIONAL";
+            font-size: 10px;
+            color: Theme.c-text-dim;
+        }
+    }
+
+    // ============ delete confirm ============
+    if (root.confirm-visible): Rectangle {
+        background: Theme.c-bg-deep.with-alpha(0.57);
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 460px;
+            height: 220px;
+            background: Theme.c-bg;
+            border-width: 1px;
+            border-color: Theme.c-danger;
+            Text {
+                x: 20px;
+                y: 16px;
+                text: "REMOVE TRACK FROM DISK?";
+                font-size: 22px;
+                color: Theme.c-text-hi;
+            }
+            Text {
+                x: 20px;
+                y: 52px;
+                width: parent.width - 40px;
+                text: root.confirm-name;
+                font-size: 13px;
+                color: Theme.c-text-hi;
+                overflow: elide;
+            }
+            Text {
+                x: 20px;
+                y: 74px;
+                width: parent.width - 40px;
+                text: root.confirm-path;
+                font-size: 10px;
+                color: Theme.c-text-dim;
+                overflow: elide;
+            }
+            Text {
+                x: 20px;
+                y: 100px;
+                text: "THIS CANNOT BE UNDONE.";
+                font-size: 12px;
+                color: Theme.c-danger;
+            }
+            Rectangle {
+                x: 20px;
+                y: parent.height - 40px;
+                width: 100px;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: "[ CANCEL ]";
+                    clicked => root.cancel-delete();
+                }
+            }
+            Rectangle {
+                x: 130px;
+                y: parent.height - 40px;
+                width: 100px;
+                height: 22px;
+                TuiBtn {
+                    width: parent.width;
+                    label: "[ DELETE ]";
+                    clicked => root.confirm-delete();
+                }
+            }
+        }
+    }
+
+    // ============ error toast ============
+    if (root.error-visible): Rectangle {
+        x: parent.width - self.width - 20px;
+        y: parent.height - 124px - 24px - self.height;
+        width: 480px;
+        height: 64px;
+        background: Theme.c-bg;
+        border-width: 1px;
+        border-color: Theme.c-text-hi;
+        Text {
+            x: 12px;
+            y: 8px;
+            text: "ERROR";
+            font-size: 12px;
+            color: Theme.c-danger;
+        }
+        CloseX {
+            x: parent.width - 46px;
+            y: 4px;
+            clicked => root.clear-error();
+        }
+        Text {
+            x: 12px;
+            y: 30px;
+            width: parent.width - 24px;
+            text: root.error-text;
+            font-size: 12px;
+            color: Theme.c-text-hi;
+            overflow: elide;
         }
     }
 }

@@ -15,10 +15,12 @@ mod eq;
 mod lyrics;
 mod notes;
 mod pitch;
+mod raster;
 mod search;
 mod song_type;
 mod sound_profile;
 mod spectrum;
+mod stage;
 mod storage;
 mod theme;
 mod theme_library;
@@ -29,6 +31,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
+    // Backtraces for the crash log (software-renderer branch is under test).
+    std::env::set_var("RUST_BACKTRACE", "1");
     install_panic_log();
 
     // Software rendering is the default on this branch (the whole point: the
@@ -56,12 +60,18 @@ fn install_panic_log() {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let backtrace = std::backtrace::Backtrace::force_capture();
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(dir.join("crash.log"))
         {
-            let _ = writeln!(file, "[{stamp}] {info}");
+            let _ = writeln!(
+                file,
+                "[{stamp}] thread={thread_name} {info}\n{backtrace}"
+            );
         }
     }));
 }

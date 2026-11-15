@@ -2,40 +2,59 @@
 // audio engine and spectrum analyzer, feeds the .slint window at ~60 fps and
 // reuses every backend module unchanged (audio/beat/lyrics/theme/...).
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use slint::{ComponentHandle, Model, VecModel};
+use slint::ComponentHandle;
 
 use crate::audio::AudioEngine;
 use crate::auto_theme::{self, Fade, Mood};
 use crate::beat_config::BeatConfig;
+use crate::download::{self, DownloadEvent};
+use crate::eq::{self, BAND_FREQS, MAX_GAIN_DB, MIN_GAIN_DB, NUM_BANDS, PRESETS};
 use crate::lyrics::{self, LyricLine};
+use crate::search::SearchIndex;
 use crate::sound_profile::SoundProfile;
-use crate::spectrum::{SpectrumEngine, VisualState, MAX_DB_VALUE};
+use crate::spectrum::{SpectrumEngine, VisualState};
+use crate::stage::{Stage, StageInput};
 use crate::storage::{self, PersistedState};
 use crate::theme::{self, Look, Rgb};
-use crate::theme_library::ThemeLibrary;
+use crate::theme::Category;
+use crate::theme_library::{ThemeEntry, ThemeLibrary};
 
 slint::include_modules!();
 
 const BEAT_VISUAL_LEAD: f64 = 0.025;
 const SAVE_EVERY: Duration = Duration::from_secs(2);
-const NUM_BARS: usize = crate::spectrum::NUM_BARS;
-/// Greyscale stops for spectrum bars, from viz.rs SPECTRUM_GREYS.
-const SPECTRUM_GREYS: [(f32, u8); 4] = [(0.00, 52), (0.22, 104), (0.52, 178), (0.85, 246)];
 const AUDIO_EXTS: [&str; 8] = ["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "alac"];
+const VOLUME_STEP: f32 = 0.05;
+const SEEK_STEP: f64 = 5.0;
+const TOP_H: f32 = 44.0;
+const DOCK_H: f32 = 124.0;
+const SIDEBAR_W: f32 = 360.0;
+const ROW_H: f32 = 26.0;
 
+#[derive(Clone)]
 pub struct TrackEntry {
     path: PathBuf,
     title: String,
     lrc: Option<PathBuf>,
+    search: SearchIndex,
 }
 
+impl TrackEntry {
+    fn new(path: PathBuf, lrc: Option<PathBuf>) -> Self {
+        let title = track_title(&path);
+        let text = format!("{} {}", title, path.display());
+        Self { path, title, lrc, search: SearchIndex::new(&text) }
+    }
+}
+
+#[derive(Clone, Copy)]
 enum PlayMode {
     Sequence,
     RepeatOne,
@@ -52,6 +71,14 @@ impl PlayMode {
     }
 
     fn label(self) -> &'static str {
+        match self {
+            Self::Sequence => "SEQUENCE",
+            Self::RepeatOne => "REPEAT ONE",
+            Self::Shuffle => "SHUFFLE",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
         match self {
             Self::Sequence => "SEQ",
             Self::RepeatOne => "ONE",
@@ -102,8 +129,34 @@ pub struct Player {
     engine: AudioEngine,
     analyzer: SpectrumEngine,
     config: BeatConfig,
-    bars: Rc<VecModel<BarData>>,
+    stage: Stage,
+    stage_dirty: bool,
+    last_stage_size: (u32, u32, f32, bool),
     playlist: Vec<TrackEntry>,
+    selected_track: Option<usize>,
+    search: String,
+    sidebar_open: bool,
+    next_queue: Vec<PathBuf>,
+    scroll_y: f32,
+    auto_scroll_target: Option<usize>,
+    show_settings: bool,
+    show_eq: bool,
+    show_download: bool,
+    track_ui_dirty: bool,
+    theme_ui_dirty: bool,
+    eq_ui_dirty: bool,
+    download_url: String,
+    env_proxy: Option<String>,
+    download_running: bool,
+    download_progress: f32,
+    download_status: String,
+    download_rx: Option<Receiver<DownloadEvent>>,
+    download_cancel: Option<Arc<AtomicBool>>,
+    maximized: bool,
+    error: Option<String>,
+    pending_delete: Option<PathBuf>,
+    ui_weak: slint::Weak<Main>,
+    seek_preview: Option<f32>,
     current: Option<usize>,
     state: PersistedState,
     dirty: bool,
@@ -129,7 +182,7 @@ pub struct Player {
 }
 
 impl Player {
-    fn new(initial: Option<PathBuf>, bars: Rc<VecModel<BarData>>) -> Self {
+    fn new(initial: Option<PathBuf>) -> Self {
         let state = storage::load();
         let config = BeatConfig::load();
         let library = ThemeLibrary::load();
@@ -146,11 +199,7 @@ impl Player {
                 .lrc_map
                 .get(path.to_string_lossy().as_ref())
                 .map(PathBuf::from);
-            playlist.push(TrackEntry {
-                title: track_title(&path),
-                lrc,
-                path,
-            });
+            playlist.push(TrackEntry::new(path, lrc));
         }
         let current = state
             .current
@@ -163,8 +212,39 @@ impl Player {
             engine,
             analyzer: SpectrumEngine::new(config.clone()),
             config,
-            bars,
+            stage: Stage::new(),
+            stage_dirty: true,
+            last_stage_size: (0, 0, 0.0, true),
             playlist,
+            selected_track: None,
+            search: String::new(),
+            auto_scroll_target: None,
+            sidebar_open: true,
+            next_queue: Vec::new(),
+            scroll_y: 0.0,
+            show_settings: false,
+            show_eq: false,
+            show_download: false,
+            track_ui_dirty: true,
+            theme_ui_dirty: true,
+            eq_ui_dirty: true,
+            download_url: String::new(),
+            env_proxy: std::env::var("HTTP_PROXY")
+                .or_else(|_| std::env::var("http_proxy"))
+                .or_else(|_| std::env::var("HTTPS_PROXY"))
+                .or_else(|_| std::env::var("https_proxy"))
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            download_running: false,
+            download_progress: 0.0,
+            download_status: String::new(),
+            download_rx: None,
+            download_cancel: None,
+            maximized: false,
+            error: None,
+            pending_delete: None,
+            ui_weak: Default::default(),
+            seek_preview: None,
             current,
             state,
             dirty: false,
@@ -200,7 +280,16 @@ impl Player {
             }
         }
         if let Some(path) = initial {
-            player.add_paths(std::iter::once(path));
+            // The command-line track plays immediately, even if it was
+            // already in the persisted playlist.
+            let mut index = player.playlist.iter().position(|track| track.path == path);
+            if index.is_none() {
+                player.add_paths(std::iter::once(path.clone()));
+                index = player.playlist.iter().position(|track| track.path == path);
+            }
+            if let Some(index) = index {
+                player.play_index(index);
+            }
         }
         player
     }
@@ -263,6 +352,9 @@ impl Player {
         self.cancel_analysis();
         self.offline = OfflineBeats::default();
         self.ring_rotation = 0.0;
+        self.stage_dirty = true;
+        self.track_ui_dirty = true;
+        self.auto_scroll_target = Some(index);
         self.spawn_analysis(path);
         self.dirty = true;
     }
@@ -472,11 +564,7 @@ impl Player {
                     .lrc_map
                     .get(path.to_string_lossy().as_ref())
                     .map(PathBuf::from);
-                self.playlist.push(TrackEntry {
-                    title: track_title(&path),
-                    lrc,
-                    path,
-                });
+                self.playlist.push(TrackEntry::new(path, lrc));
             }
         }
         if first_new.is_some() {
@@ -533,9 +621,423 @@ impl Player {
     }
 
     fn advance(&mut self, forward: bool) {
+        if forward {
+            if !self.next_queue.is_empty() {
+                let path = self.next_queue.remove(0);
+                if let Some(index) = self
+                    .playlist
+                    .iter()
+                    .position(|track| track.path == path)
+                {
+                    self.track_ui_dirty = true;
+                    self.play_index(index);
+                    return;
+                }
+            }
+        }
         if let Some(index) = self.pick_next(forward) {
             self.play_index(index);
         }
+    }
+
+    fn close_context(&mut self) {
+        CONTEXT_SLOT.with(|cell| {
+            if let Some((index, x, y)) = cell.borrow_mut().take() {
+                if let Some(ui) = self.ui_weak.upgrade() {
+                    ui.set_context_index(-1);
+                    let _ = (x, y);
+                }
+                self.track_ui_dirty = true;
+            }
+        });
+    }
+
+    fn open_context_menu(&mut self, ui: &Main) {
+        CONTEXT_SLOT.with(|cell| {
+            let guard = cell.borrow();
+            if let Some((index, x, y)) = *guard {
+                drop(guard);
+                let Some(track) = self.playlist.get(index) else {
+                    ui.set_context_index(-1);
+                    return;
+                };
+                ui.set_context_index(index as i32);
+                ui.set_context_x(x);
+                ui.set_context_y(y);
+                ui.set_context_title(track.title.clone().into());
+                ui.set_context_has_lrc(track.lrc.is_some());
+            }
+        });
+    }
+
+    fn toggle_play(&mut self) {
+        if self.engine.info().is_none() {
+            let index = self.current.or_else(|| self.pick_next(true));
+            if let Some(index) = index {
+                self.play_index(index);
+            } else {
+                self.add_files_dialog();
+            }
+        } else {
+            self.engine.toggle_pause();
+            self.track_ui_dirty = true;
+            self.dirty = true;
+        }
+    }
+
+    fn stop(&mut self) {
+        self.cancel_analysis();
+        self.engine.stop();
+        self.offline = OfflineBeats::default();
+        self.visual = VisualState::default();
+        self.core_seq = 0;
+        self.beat_age = 1.0;
+        self.ring_strength = 0.0;
+        self.track_ui_dirty = true;
+        self.dirty = true;
+    }
+
+    fn queue_next(&mut self, index: usize) {
+        if self.current == Some(index) {
+            return;
+        }
+        let Some(track) = self.playlist.get(index) else {
+            return;
+        };
+        if !self.next_queue.iter().any(|queued| queued == &track.path) {
+            self.next_queue.push(track.path.clone());
+            self.track_ui_dirty = true;
+        }
+    }
+
+    fn open_track_location(&mut self, index: usize) {
+        let Some(track) = self.playlist.get(index) else {
+            return;
+        };
+        let path = track.path.clone();
+        if !path.exists() {
+            self.error = Some(format!("FILE NOT FOUND / {}", path.display()));
+            return;
+        }
+        if let Err(error) = std::process::Command::new("explorer")
+            .arg("/select,")
+            .arg(&path)
+            .spawn()
+        {
+            self.error = Some(format!("OPEN LOCATION FAILED / {error}"));
+        }
+    }
+
+    fn remove_track_at(&mut self, index: usize, delete_file: bool) {
+        let Some(track) = self.playlist.get(index).cloned() else {
+            return;
+        };
+        let path = track.path.clone();
+        let is_current = self.current == Some(index);
+
+        if is_current {
+            self.stop();
+        }
+        if delete_file {
+            if let Err(error) = std::fs::remove_file(&path) {
+                self.error = Some(format!("DELETE FAILED / {error}"));
+                return;
+            }
+            if let Some(lrc) = track.lrc.clone() {
+                let _ = std::fs::remove_file(&lrc);
+            }
+        }
+
+        self.playlist.remove(index);
+        self.lrc_map_remove(&path);
+        if self.selected_track == Some(index) {
+            self.selected_track = None;
+        } else if let Some(selected) = self.selected_track {
+            if selected > index {
+                self.selected_track = Some(selected - 1);
+            }
+        }
+        self.next_queue.retain(|queued| queued != &path);
+        if is_current {
+            self.current = None;
+            self.lyrics.clear();
+            self.lyrics_synced = false;
+            self.lyrics_track = None;
+        } else if let Some(current) = self.current {
+            if current > index {
+                self.current = Some(current - 1);
+            }
+        }
+        self.track_ui_dirty = true;
+        self.dirty = true;
+    }
+
+    fn lrc_map_remove(&mut self, path: &Path) {
+        self.state
+            .lrc_map
+            .remove(path.to_string_lossy().as_ref());
+    }
+
+    fn import_lrc(&mut self, index: usize) {
+        let Some(track) = self.playlist.get(index) else {
+            return;
+        };
+        let Some(lrc) = rfd::FileDialog::new()
+            .set_title("Import lyrics")
+            .add_filter("Lyrics", &["lrc"])
+            .pick_file()
+        else {
+            return;
+        };
+        self.state
+            .lrc_map
+            .insert(track.path.to_string_lossy().into_owned(), lrc.display().to_string());
+        self.refresh_lyrics_for(index);
+        self.track_ui_dirty = true;
+        self.dirty = true;
+    }
+
+    fn clear_lrc(&mut self, index: usize) {
+        let path = match self.playlist.get(index) {
+            Some(track) => track.path.clone(),
+            None => return,
+        };
+        self.lrc_map_remove(&path);
+        self.refresh_lyrics_for(index);
+        self.track_ui_dirty = true;
+        self.dirty = true;
+    }
+
+    fn refresh_lyrics_for(&mut self, index: usize) {
+        if self.current == Some(index) {
+            self.refresh_lyrics();
+        }
+    }
+
+    fn seek_relative(&mut self, seconds: f64) {
+        if self.engine.info().is_none() {
+            return;
+        }
+        let position = self.engine.position();
+        let duration = self.duration();
+        let target = (position + seconds).clamp(0.0, duration.max(0.0));
+        if self.engine.seek(target) {
+            self.mark_lyric_seek(target);
+        }
+    }
+
+    fn adjust_volume(&mut self, delta: f32) {
+        let volume = (self.engine.volume() + delta).clamp(0.0, 1.25);
+        self.engine.set_volume(volume);
+        self.state.volume = volume;
+        self.dirty = true;
+    }
+
+    fn set_volume(&mut self, volume: f32) {
+        let volume = volume.clamp(0.0, 1.25);
+        self.engine.set_volume(volume);
+        self.state.volume = volume;
+        self.dirty = true;
+    }
+
+    fn set_style(&mut self, style: u8) {
+        match style {
+            0 => {
+                self.state.piano_mode = false;
+                self.state.led_bars = false;
+                self.state.braille_stream = false;
+            }
+            1 => {
+                self.state.piano_mode = false;
+                self.state.led_bars = true;
+                self.state.braille_stream = true;
+            }
+            _ => {
+                self.state.piano_mode = true;
+            }
+        }
+        self.stage_dirty = true;
+        self.dirty = true;
+    }
+
+    fn cycle_visual_mode(&mut self) {
+        if self.state.piano_mode {
+            self.set_style(0);
+        } else if self.state.led_bars && self.state.braille_stream {
+            self.set_style(2);
+        } else {
+            self.set_style(1);
+        }
+    }
+
+    fn toggle_overlay(&mut self, which: u8) {
+        match which {
+            0 => {
+                self.show_settings = !self.show_settings;
+                if self.show_settings {
+                    self.show_eq = false;
+                    self.show_download = false;
+                    self.theme_ui_dirty = true;
+                }
+            }
+            1 => {
+                self.show_eq = !self.show_eq;
+                if self.show_eq {
+                    self.show_settings = false;
+                    self.show_download = false;
+                }
+            }
+            _ => {
+                self.show_download = !self.show_download;
+                if self.show_download {
+                    self.show_settings = false;
+                    self.show_eq = false;
+                }
+            }
+        }
+    }
+
+    // ---------- EQ ----------
+
+    fn apply_eq(&mut self) {
+        let Ok(gains) = <[f32; NUM_BANDS]>::try_from(self.state.eq_gains.clone()) else {
+            return;
+        };
+        self.engine.set_eq(&gains, self.state.eq_enabled);
+        self.dirty = true;
+    }
+
+    fn eq_preset_label(&self) -> String {
+        if self.state.eq_preset == 0 {
+            "CUSTOM  ".to_owned()
+        } else {
+            format!("{:<8}", PRESETS[self.state.eq_preset - 1].0)
+        }
+    }
+
+    fn cycle_eq_preset(&mut self, delta: i32) {
+        let count = PRESETS.len() as i32 + 1;
+        let current = self.state.eq_preset as i32;
+        let next = (current + delta).rem_euclid(count) as usize;
+        self.state.eq_preset = next;
+        if next > 0 {
+            self.state.eq_gains = PRESETS[next - 1].1.to_vec();
+            self.apply_eq();
+        }
+        self.eq_ui_dirty = true;
+    }
+
+    fn reset_eq(&mut self) {
+        self.state.eq_preset = 1;
+        self.state.eq_gains = PRESETS[0].1.to_vec();
+        self.apply_eq();
+        self.eq_ui_dirty = true;
+    }
+
+    fn set_eq_band(&mut self, index: usize, gain: f32) {
+        if index >= NUM_BANDS {
+            return;
+        }
+        let gain = gain.clamp(MIN_GAIN_DB, MAX_GAIN_DB);
+        if (self.state.eq_gains[index] - gain).abs() > f32::EPSILON {
+            self.state.eq_gains[index] = gain;
+            self.state.eq_preset = 0;
+            self.apply_eq();
+            self.eq_ui_dirty = true;
+        }
+    }
+
+    // ---------- download ----------
+
+    fn start_download(&mut self) {
+        if self.download_running {
+            return;
+        }
+        let input = self.download_url.trim().to_owned();
+        if input.is_empty() {
+            self.download_status = "ENTER A SOURCE URL OR BV ID".to_owned();
+            return;
+        }
+
+        let output_dir = storage::download_dir();
+        let _ = std::fs::create_dir_all(&output_dir);
+        let proxy = {
+            let proxy = self.state.proxy.trim().to_owned();
+            (!proxy.is_empty()).then_some(proxy)
+        };
+        let (sender, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        download::spawn(input, output_dir, proxy, sender, Arc::clone(&cancel));
+        self.download_rx = Some(receiver);
+        self.download_cancel = Some(cancel);
+        self.download_progress = 0.0;
+        self.download_status = "QUEUED".to_owned();
+        self.download_running = true;
+    }
+
+    fn cancel_download(&mut self) {
+        if let Some(cancel) = &self.download_cancel {
+            cancel.store(true, Ordering::Relaxed);
+            self.download_status = "CANCELLING".to_owned();
+        }
+    }
+
+    fn poll_download(&mut self) {
+        let Some(mut receiver) = self.download_rx.take() else {
+            return;
+        };
+        let mut keep = true;
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => match event {
+                    DownloadEvent::Status(text) => self.download_status = text,
+                    DownloadEvent::Progress(fraction) => {
+                        self.download_progress = fraction.clamp(0.0, 1.0);
+                    }
+                    DownloadEvent::Done(path) => {
+                        self.download_running = false;
+                        self.download_cancel = None;
+                        keep = false;
+                        self.add_paths([path]);
+                    }
+                    DownloadEvent::Error(text) => {
+                        self.download_running = false;
+                        self.download_cancel = None;
+                        keep = false;
+                        self.download_status = text;
+                    }
+                    DownloadEvent::Cancelled => {
+                        self.download_running = false;
+                        self.download_cancel = None;
+                        keep = false;
+                        self.download_status = String::new();
+                        self.download_progress = 0.0;
+                    }
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.download_running = false;
+                    self.download_cancel = None;
+                    keep = false;
+                    break;
+                }
+            }
+        }
+        if keep {
+            self.download_rx = Some(receiver);
+        }
+    }
+
+    // ---------- selection / search ----------
+
+    fn filtered_indices(&self) -> Vec<usize> {
+        let query = self.search.trim().to_lowercase();
+        self.playlist
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| query.is_empty() || track.search.matches(&query))
+            .map(|(index, _)| index)
+            .collect()
     }
 
     // ---------- persistence ----------
@@ -627,6 +1129,7 @@ impl Player {
         }
 
         self.poll_analysis();
+        self.poll_download();
 
         if let Some(fade) = &self.fade {
             let (look, done) = fade.sample(Instant::now());
@@ -644,90 +1147,414 @@ impl Player {
     fn push_state(&mut self, ui: &Main) {
         let theme = ui.global::<Theme>();
         let look = theme::current_look();
-        let corners = look.gradient.unwrap_or([look.palette.bg; 4]);
-        let [tl, tr, br, bl] = corners;
-        let bg_top = theme::mix_rgb(tl, tr, 0.5);
-        let bg_bottom = theme::mix_rgb(bl, br, 0.5);
-        theme.set_bg_top(rgb(bg_top));
-        theme.set_bg_bottom(rgb(bg_bottom));
-        theme.set_corner_tl(rgba(tl, 96));
-        theme.set_corner_br(rgba(br, 96));
-        theme.set_c_bg_deep(rgb(look.palette.bg_deep));
-        theme.set_c_surface(rgb(look.palette.surface));
-        theme.set_c_line(rgb(look.palette.line));
-        theme.set_c_text_hi(rgb(look.palette.text_hi));
-        theme.set_c_text(rgb(look.palette.text));
-        theme.set_c_text_dim(rgb(look.palette.text_dim));
-        theme.set_c_ring(rgba(theme::ink(210), 20));
-        theme.set_c_ring_hi(rgba(theme::ink(225), 110));
+        theme.set_c_bg(rgba(look.palette.bg, 255));
+        theme.set_c_bg_deep(rgba(look.palette.bg_deep, 255));
+        theme.set_c_surface(rgba(look.palette.surface, 255));
+        theme.set_c_line(rgba(look.palette.line, 255));
+        theme.set_c_text_hi(rgba(look.palette.text_hi, 255));
+        theme.set_c_text(rgba(look.palette.text, 255));
+        theme.set_c_text_dim(rgba(look.palette.text_dim, 255));
+        theme.set_c_danger(rgba(theme::danger(), 255));
 
-        let bars = self.analyzer.bars();
-        let peaks = self.analyzer.peaks();
-        let show_peaks = self.state.peak_hold;
-        for index in 0..NUM_BARS {
-            let raw = bars.get(index).copied().unwrap_or(0.0);
-            let len = (raw / MAX_DB_VALUE).clamp(0.0, 1.0);
-            let peak = (peaks.get(index).copied().unwrap_or(0.0) / MAX_DB_VALUE)
-                .clamp(0.0, 1.0);
-            let col = rgb(theme::ink(spectrum_grey(len)));
-            // Bar angle: start at the bottom like viz.rs and spin slowly.
-            let angle = std::f32::consts::FRAC_PI_2
-                + index as f32 / NUM_BARS as f32 * std::f32::consts::TAU
-                + self.ring_rotation;
-            self.bars.set_row_data(
-                index,
-                BarData {
-                    len,
-                    peak: if show_peaks { peak } else { 0.0 },
-                    dx: angle.cos(),
-                    dy: angle.sin(),
-                    col,
+        // Geometry: sidebar + top bar + dock carve the stage out of the window.
+        let window = ui.window();
+        let scale = window.scale_factor() as f32;
+        let size = window.size();
+        let logical_w = size.width as f32 / scale;
+        let logical_h = size.height as f32 / scale;
+        let sidebar_w = if self.sidebar_open { SIDEBAR_W } else { 0.0 };
+        let stage_rect = (
+            sidebar_w,
+            TOP_H,
+            (logical_w - sidebar_w).max(1.0),
+            (logical_h - TOP_H - DOCK_H).max(1.0),
+        );
+        ui.set_sidebar_open(self.sidebar_open);
+        ui.set_stage_x(stage_rect.0);
+        ui.set_stage_y(stage_rect.1);
+        ui.set_stage_w(stage_rect.2);
+        ui.set_stage_h(stage_rect.3);
+
+        // The stage texture only needs a repaint while something actually
+        // moves; standby with a silent analyzer is a fully static frame.
+        let active = self.engine.info().is_some() && !self.engine.is_paused();
+        let size_changed = self.last_stage_size
+            != (size.width, size.height, scale, self.sidebar_open);
+        let must_paint = active
+            || self.analyzer.has_signal()
+            || self.visual.energy > 0.002
+            || self.fade.is_some()
+            || self.stage_dirty
+            || size_changed;
+        if must_paint {
+            self.last_stage_size = (size.width, size.height, scale, self.sidebar_open);
+            self.stage_dirty = false;
+            let output = self.stage.paint(
+                size.width.max(1),
+                size.height.max(1),
+                scale,
+                &look,
+                stage_rect,
+                StageInput {
+                    bars: self.analyzer.bars(),
+                    peaks: self.analyzer.peaks(),
+                    visual: self.visual,
+                    playing: active,
+                    pulse_enabled: self.state.show_core_pulse,
+                    show_bg_spectrum: self.state.show_bg_spectrum,
+                    show_radial: self.state.show_radial,
+                    peak_hold: self.state.peak_hold,
+                    rotation: self.ring_rotation,
+                    radial_scale: self.state.radial_scale,
+                    led_bars: self.state.led_bars,
+                    dot_style: self.state.led_bars && self.state.braille_stream,
+                    braille_stream: self.state.braille_stream,
+                    beat_age: self.beat_age,
+                    ring_strength: self.ring_strength,
                 },
             );
+            ui.set_stage(slint::Image::from_rgba8(output.buffer));
+            ui.set_disc_r(output.disc_r);
+            if let Some(grid) = output.grid {
+                ui.set_grid_l(stage_rect.0 + grid.left);
+                ui.set_grid_r(stage_rect.0 + grid.right);
+                ui.set_grid_cx(stage_rect.0 + grid.center_x);
+            }
         }
-        ui.set_pulse(self.ring_strength * (1.0 - self.beat_age));
-        ui.set_beat_age(self.beat_age);
-        ui.set_kick(self.visual.kick);
-        ui.set_radial_scale(self.state.radial_scale);
-        ui.set_show_bg_spectrum(self.state.show_bg_spectrum);
-        ui.set_show_radial(self.state.show_radial);
-        ui.set_show_peaks(show_peaks);
 
+        // Dock: title, metadata, ASCII seek + volume, transport labels.
         let position = self.position();
         let duration = self.duration();
         let paused = self.engine.is_paused();
-        ui.set_time_text(format!(
-            "{}/{}",
-            short_time(position),
-            short_time(duration)
-        ).into());
-        let status = if self.engine.info().is_none() {
-            "[STANDBY]"
-        } else if paused {
-            "[PAUSED]"
+        let info = self.engine.info();
+        let time_text = format!("{} / {}", short_time(position), short_time(duration));
+        let progress = if duration > 0.0 {
+            (position / duration).clamp(0.0, 1.0) as f32
         } else {
-            "[PLAYING]"
+            0.0
         };
-        ui.set_status_text(status.to_owned().into());
-        ui.set_paused(paused);
-        ui.set_has_track(self.engine.info().is_some());
-        ui.set_track_title(
-            self.current
-                .and_then(|index| self.playlist.get(index))
-                .map(|track| track.title.clone())
-                .unwrap_or_default()
-                .into(),
-        );
-        ui.set_theme_label(self.theme_label().into());
-        ui.set_mode_label(self.mode().label().to_owned().into());
-        ui.set_volume(self.engine.volume());
-        if duration > 0.0 {
-            ui.set_progress((position / duration).clamp(0.0, 1.0) as f32);
+
+        let (title_text, title_live) = self
+            .current
+            .and_then(|index| self.playlist.get(index))
+            .map(|track| (track.title.clone(), true))
+            .unwrap_or_else(|| ("DROP AUDIO HERE / CTRL+O".to_owned(), false));
+        ui.set_dock_title(title_text.into());
+        ui.set_dock_title_live(title_live);
+
+        let format_label = info
+            .map(|info| extension_label(&info.path))
+            .unwrap_or_else(|| "---".to_owned());
+        let rate = info.map(|info| info.sample_rate as f32).unwrap_or(0.0);
+        let output = if info.is_some() {
+            elide_chars(&self.engine.output_label(), 46)
         } else {
-            ui.set_progress(0.0);
+            "NO OUTPUT".to_owned()
+        };
+        ui.set_meta_prefix(format!("{}   {:.1}K   ", format_label, rate / 1000.0).into());
+        ui.set_meta_output(output.into());
+
+        let mode = self.mode();
+        let mode_text = if self.next_queue.is_empty() {
+            format!("MODE: {}", mode.label())
+        } else {
+            format!("MODE: {}   NEXT {:02}", mode.label(), self.next_queue.len())
+        };
+        ui.set_mode_text(mode_text.clone().into());
+        ui.set_mode_long(mode.label().to_owned().into());
+        ui.set_mode_short(mode.short_label().to_owned().into());
+
+        // ASCII meter geometry: 13 px cell, track width capped at 55% of the
+        // window, minus the time readout, exactly like the egui dock.
+        let cell_w = 13.0_f32;
+        let title_max_w = (logical_w * 0.55).max(260.0);
+        let time_w = time_text.chars().count() as f32 * cell_w;
+        let cells = (((title_max_w - 10.0 - time_w) / cell_w).floor() as isize - 2)
+            .clamp(18, 140) as usize;
+        let shown = self.seek_preview.unwrap_or(progress);
+        let filled = ((shown * cells as f32).round() as usize).min(cells);
+        ui.set_seek_cells(cells as i32);
+        ui.set_seek_filled(filled as i32);
+        ui.set_seek_filled_str("#".repeat(filled).into());
+        ui.set_seek_rest_str("-".repeat(cells - filled).into());
+        ui.set_time_text(time_text.clone().into());
+        ui.set_progress(progress);
+
+        let vol_norm = (self.engine.volume() / 1.25).clamp(0.0, 1.0);
+        let vol_cells = 16usize;
+        let vol_filled = ((vol_norm * vol_cells as f32).round() as usize).min(vol_cells);
+        ui.set_vol_filled(vol_filled as i32);
+        ui.set_vol_fill_str("#".repeat(vol_filled).into());
+        ui.set_vol_rest_str("-".repeat(vol_cells - vol_filled).into());
+        ui.set_vol_pct(format!("{:>3}%", (vol_norm * 100.0).round() as i32).into());
+
+        ui.set_play_label(if active { "PAUSE" } else { "PLAY" }.into());
+
+        // Overlays.
+        ui.set_show_settings(self.show_settings);
+        ui.set_show_eq(self.show_eq);
+        ui.set_show_download(self.show_download);
+        ui.set_show_lyrics(self.state.show_lyrics);
+        ui.set_peak_hold(self.state.peak_hold);
+        ui.set_show_bg_spectrum(self.state.show_bg_spectrum);
+        ui.set_show_radial(self.state.show_radial);
+        ui.set_show_core_pulse(self.state.show_core_pulse);
+        ui.set_radial_scale(self.state.radial_scale);
+        let style = if self.state.piano_mode {
+            2
+        } else if self.state.led_bars && self.state.braille_stream {
+            1
+        } else {
+            0
+        };
+        ui.set_visual_style(style);
+        ui.set_out_label(if info.is_some() {
+            self.engine.output_label()
+        } else {
+            String::new()
+        }.into());
+
+        // EQ panel.
+        ui.set_eq_enabled(self.state.eq_enabled);
+        ui.set_eq_preset_name(self.eq_preset_label().into());
+        ui.set_eq_hint(
+            if self.state.eq_enabled {
+                "DRAG A BAND TO ADJUST / -12..+12 DB"
+            } else {
+                "EQ BYPASS / DRAG TO EDIT"
+            }
+            .into(),
+        );
+        if self.eq_ui_dirty {
+            self.eq_ui_dirty = false;
+            let mut model = slint::VecModel::<EqBandData>::default();
+            for (index, gain) in self.state.eq_gains.iter().enumerate() {
+                model.push(EqBandData {
+                    gain: *gain,
+                    label: format_gain(*gain).into(),
+                    freq: format_frequency(BAND_FREQS[index]).into(),
+                });
+            }
+            ui.set_eq_bands(slint::ModelRc::from(Rc::new(model)));
+        }
+
+        // Download panel.
+        ui.set_download_running(self.download_running);
+        ui.set_env_proxy_visible(self.env_proxy.is_some());
+        if self.download_running || self.download_progress > 0.0 {
+            let cells = 32usize;
+            let filled = ((self.download_progress * cells as f32).round() as usize).min(cells);
+            ui.set_download_progress_text(
+                format!(
+                    "[{}{}] {:>3}%",
+                    "#".repeat(filled),
+                    "-".repeat(cells - filled),
+                    (self.download_progress * 100.0).round() as i32
+                )
+                .into(),
+            );
+        } else {
+            ui.set_download_progress_text(String::new().into());
+        }
+        ui.set_download_status(self.download_status.clone().into());
+        ui.set_download_out_dir(storage::download_dir().display().to_string().into());
+
+        // Modal + toast.
+        ui.set_error_visible(self.error.is_some());
+        if let Some(error) = &self.error {
+            ui.set_error_text(elide_chars(error, 160).into());
+        }
+
+        // Sidebar UI: rebuild the track model on change; auto-scroll to the
+        // track that just started playing.
+        ui.set_track_count(self.playlist.len() as i32);
+        let list_h = (logical_h - TOP_H - DOCK_H - 111.0).max(60.0);
+        let content_h = self.playlist.len() as f32 * ROW_H;
+        let scroll_max = (content_h - list_h).max(0.0);
+        ui.set_scroll_max(scroll_max);
+        if let Some(index) = self.auto_scroll_target.take() {
+            let row = self.filtered_indices()
+                .iter()
+                .position(|&filtered| filtered == index)
+                .unwrap_or(index) as f32;
+            self.scroll_y = ((row * ROW_H - list_h * 0.5).clamp(0.0, scroll_max)) as f32;
+        }
+        self.scroll_y = self.scroll_y.clamp(0.0, scroll_max);
+        ui.set_scroll_y(self.scroll_y);
+        let filtered = self.filtered_indices();
+        let current_cell = if filtered.is_empty() {
+            -1
+        } else {
+            self.current
+                .and_then(|current| filtered.iter().position(|&index| index == current))
+                .map(|row| {
+                    let cells = ((list_h / 13.0).floor().max(1.0)) as i32;
+                    (((row as f32 + 0.5) / filtered.len() as f32) * cells as f32)
+                        .floor()
+                        .min((cells - 1) as f32) as i32
+                })
+                .unwrap_or(-1)
+        };
+        ui.set_current_cell(current_cell);
+
+        if self.track_ui_dirty {
+            self.track_ui_dirty = false;
+            let mut model = slint::VecModel::<TrackRow>::default();
+            for &index in &filtered {
+                let track = &self.playlist[index];
+                let selected = self.current == Some(index) || self.selected_track == Some(index);
+                let playing = self.current == Some(index) && active;
+                model.push(TrackRow {
+                    index: index as i32,
+                    title: track.title.clone().into(),
+                    meta: extension_label(&track.path).into(),
+                    has_lrc: track.lrc.is_some(),
+                    selected,
+                    playing,
+                    focused: self.selected_track == Some(index),
+                });
+            }
+            ui.set_tracks(slint::ModelRc::from(Rc::new(model)));
+        }
+
+        self.open_context_menu(ui);
+
+        // Theme panel data.
+        if self.theme_ui_dirty {
+            self.theme_ui_dirty = false;
+            self.push_theme_models(ui);
         }
 
         self.push_lyrics(ui, position);
+    }
+
+    fn push_theme_models(&mut self, ui: &Main) {
+        let auto = self.state.auto_theme;
+        let auto_mood = self.state.auto_mood.unwrap_or_default();
+        let current = auto.map(|_| None).unwrap_or_else(|| self.state.theme_name.as_deref().and_then(|name| self.library.find(name)));
+        let current_entry = current.and_then(|index| self.library.entry(index));
+
+        let current_line = match auto {
+            Some(dark) => format!(
+                "CURRENT: AUTO {} / {}",
+                if dark { "DARK" } else { "LIGHT" },
+                auto_mood.kind.label()
+            ),
+            None => {
+                let category = current_entry.map_or("-", |entry| entry.category.label());
+                format!(
+                    "CURRENT: {} / {category}",
+                    self.state.theme_name.as_deref().unwrap_or("-")
+                )
+            }
+        };
+        ui.set_theme_current_line(current_line.into());
+        ui.set_theme_auto_status(if auto.is_some() {
+            auto_status(auto, self.state.auto_mood)
+        } else {
+            String::new()
+        }.into());
+        ui.set_theme_file_path(crate::theme_library::ThemeLibrary::path().display().to_string().into());
+        ui.set_theme_load_error(
+            self.library
+                .load_error()
+                .map(|error| format!("THEMES.JSON ERROR / {error}"))
+                .unwrap_or_default()
+                .into(),
+        );
+        ui.set_theme_warnings(
+            self.library
+                .warnings()
+                .first()
+                .map(|first| {
+                    let count = self.library.warnings().len();
+                    let more = if count == 1 { String::new() } else { format!(" (+{} MORE)", count - 1) };
+                    format!("SKIPPED {first}{more}")
+                })
+                .unwrap_or_default()
+                .into(),
+        );
+        let customize = match (auto, current_entry) {
+            (Some(_), _) => false,
+            (None, Some(entry)) if entry.spec.is_some() => true,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        ui.set_theme_can_customize(customize && self.library.editable());
+        ui.set_theme_customize_label(
+            if current_entry.is_some_and(|entry| entry.spec.is_some()) {
+                "[ EDIT ]"
+            } else {
+                "[ CUSTOMIZE ]"
+            }
+            .into(),
+        );
+
+        let chip_colors = |look: &Look| (rgba(look.gradient.map_or(look.palette.bg, |g| g[0]), 255), rgba(look.gradient.map_or(look.palette.bg, |g| g[3]), 255), rgba(look.palette.text_hi, 255), rgba(look.palette.text_dim, 255));
+        let mut autos = slint::VecModel::<ChipData>::default();
+        for (label, dark) in [("AUTO DARK", true), ("AUTO LIGHT", false)] {
+            let look = auto_theme::look(auto_mood, dark);
+            let (ga, gb, fg, dim) = chip_colors(&look);
+            autos.push(ChipData {
+                name: label.into(),
+                grad_a: ga,
+                grad_b: gb,
+                fg,
+                dim,
+                active: auto == Some(dark),
+                dark,
+                index: 0,
+                col: 0,
+                row: 0,
+            });
+        }
+        ui.set_auto_chips(slint::ModelRc::from(Rc::new(autos)));
+
+        let mut groups = slint::VecModel::<ChipGroup>::default();
+        let entries = self.library.entries();
+        let mut offset = 0usize;
+        for category in Category::ALL {
+            let members: Vec<usize> = (0..entries.len())
+                .filter(|&index| entries[index].category == category)
+                .collect();
+            if members.is_empty() && category != Category::Custom {
+                continue;
+            }
+            let mut chips = slint::VecModel::<ChipData>::default();
+            let (dark, light): (Vec<usize>, Vec<usize>) = members
+                .iter()
+                .partition(|&&index| entries[index].look.palette.dark);
+            let rows: Vec<&[usize]> = if members.len() <= 4 {
+                vec![&members[..]]
+            } else {
+                dark.chunks(4).chain(light.chunks(4)).collect()
+            };
+            for (row, row_members) in rows.iter().enumerate() {
+                for (col, &index) in row_members.iter().enumerate() {
+                    let entry = &entries[index];
+                    let (ga, gb, fg, dim) = chip_colors(&entry.look);
+                    chips.push(ChipData {
+                        name: entry.name.clone().into(),
+                        grad_a: ga,
+                        grad_b: gb,
+                        fg,
+                        dim,
+                        active: current == Some(index),
+                        dark: entry.look.palette.dark,
+                        index: index as i32,
+                        col: col as i32,
+                        row: row as i32,
+                    });
+                }
+            }
+            groups.push(ChipGroup {
+                label: category.label().into(),
+                offset: offset as i32,
+                chips: slint::ModelRc::from(Rc::new(chips)),
+            });
+            offset += 1 + rows.iter().map(|row| row.len().div_ceil(4)).sum::<usize>().max(1);
+        }
+        ui.set_theme_groups(slint::ModelRc::from(Rc::new(groups)));
     }
 
     fn push_lyrics(&mut self, ui: &Main, position: f64) {
@@ -770,30 +1597,55 @@ impl Player {
 
 // ---------- helpers ----------
 
-fn rgb(rgb: Rgb) -> slint::Color {
-    slint::Color::from_rgb_u8(rgb[0], rgb[1], rgb[2])
-}
-
 fn rgba(rgb: Rgb, a: u8) -> slint::Color {
     slint::Color::from_argb_u8(a, rgb[0], rgb[1], rgb[2])
 }
 
-fn spectrum_grey(norm: f32) -> u8 {
-    let value = norm.clamp(0.0, 1.0);
-    let mut lower = SPECTRUM_GREYS[0];
-    let mut upper = SPECTRUM_GREYS[SPECTRUM_GREYS.len() - 1];
-    for pair in SPECTRUM_GREYS.windows(2) {
-        if value >= pair[0].0 && value <= pair[1].0 {
-            lower = pair[0];
-            upper = pair[1];
-            break;
-        }
+fn extension_label(path: &Path) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_uppercase())
+        .unwrap_or_else(|| "AUDIO".to_owned())
+}
+
+fn format_gain(gain: f32) -> String {
+    let rounded = (gain * 10.0).round() / 10.0;
+    if rounded == 0.0 {
+        "+0.0".to_owned()
+    } else if rounded > 0.0 {
+        format!("+{rounded:.1}")
+    } else {
+        format!("{rounded:.1}")
     }
-    let span = (upper.0 - lower.0).max(1e-6);
-    let t = ((value - lower.0) / span).clamp(0.0, 1.0);
-    (lower.1 as f32 + (upper.1 as f32 - lower.1 as f32) * t)
-        .round()
-        .clamp(0.0, 255.0) as u8
+}
+
+fn format_frequency(freq: f32) -> String {
+    if freq >= 1000.0 {
+        format!("{:.1}K", freq / 1000.0)
+    } else {
+        format!("{:.0}", freq)
+    }
+}
+
+fn elide_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_owned()
+    } else {
+        let cut: String = text.chars().take(max_chars).collect();
+        format!("{cut}...")
+    }
+}
+
+fn auto_status(dark: Option<bool>, mood: Option<Mood>) -> String {
+    let mood = mood.unwrap_or_default();
+    match dark {
+        Some(dark) => format!(
+            "AUTO {} / {}",
+            if dark { "DARK" } else { "LIGHT" },
+            mood.kind.label()
+        ),
+        None => String::new(),
+    }
 }
 
 fn short_time(seconds: f64) -> String {
@@ -854,6 +1706,11 @@ thread_local! {
     static PLAYER: RefCell<Option<Player>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// The currently open track context menu: (playlist index, x, y).
+    static CONTEXT_SLOT: RefCell<Option<(usize, f32, f32)>> = const { RefCell::new(None) };
+}
+
 fn with_player<R>(body: impl FnOnce(&mut Player) -> R) -> Option<R> {
     PLAYER.with(|cell| {
         let mut guard = cell.borrow_mut();
@@ -865,34 +1722,12 @@ pub fn run(initial: Option<PathBuf>) {
     register_fonts();
 
     let ui = Main::new().expect("slint window");
-    let bars = Rc::new(VecModel::from(
-        std::iter::repeat(BarData {
-            len: 0.0,
-            peak: 0.0,
-            dx: 0.0,
-            dy: 0.0,
-            col: slint::Color::from_rgb_u8(0, 0, 0),
-        })
-        .take(NUM_BARS)
-        .collect::<Vec<_>>(),
-    ));
-    ui.set_bars(slint::ModelRc::from(bars.clone()));
 
-    let player = Player::new(initial, bars);
+    let mut player = Player::new(initial);
 
     ui.on_toggle_play(|| {
         with_player(|player| {
-            if player.engine.info().is_none() {
-                let index = player.current.or_else(|| player.pick_next(true));
-                if let Some(index) = index {
-                    player.play_index(index);
-                } else {
-                    player.add_files_dialog();
-                }
-            } else {
-                player.engine.toggle_pause();
-                player.dirty = true;
-            }
+            player.toggle_play();
             player.save_if_due();
         });
     });
@@ -908,23 +1743,36 @@ pub fn run(initial: Option<PathBuf>) {
             player.save_if_due();
         });
     });
-    ui.on_seek_to(|fraction| {
-        with_player(|player| {
-            let duration = player.duration();
-            if duration > 0.0 {
-                let target = (fraction.clamp(0.0, 1.0) as f64) * duration;
-                if player.engine.seek(target) {
-                    player.mark_lyric_seek(target);
+    ui.on_stop(|| {
+        with_player(|player| player.stop());
+    });
+    ui.on_seek(|code| {
+        with_player(|player| match code {
+            code if code < 0.0 => {
+                // Arrow keys arrive as sentinel codes: -1 = back, -2 = forward.
+                player.seek_relative(if code == -1.0 { -SEEK_STEP } else { SEEK_STEP });
+                player.seek_preview = None;
+            }
+            fraction => {
+                let duration = player.duration();
+                if duration > 0.0 {
+                    let target = (fraction.clamp(0.0, 1.0) as f64) * duration;
+                    if player.engine.seek(target) {
+                        player.mark_lyric_seek(target);
+                    }
                 }
+                player.seek_preview = None;
             }
         });
     });
-    ui.on_set_volume(|value| {
-        with_player(|player| {
-            let value = value.clamp(0.0, 1.0);
-            player.engine.set_volume(value);
-            player.state.volume = value;
-            player.dirty = true;
+    ui.on_seek_preview(|fraction| {
+        with_player(|player| player.seek_preview = Some(fraction.clamp(0.0, 1.0)));
+    });
+    ui.on_set_volume(|code| {
+        with_player(|player| match code {
+            -1.0 => player.adjust_volume(VOLUME_STEP),
+            -2.0 => player.adjust_volume(-VOLUME_STEP),
+            value => player.set_volume(value),
         });
     });
     ui.on_cycle_mode(|| {
@@ -936,39 +1784,317 @@ pub fn run(initial: Option<PathBuf>) {
     ui.on_add_files(|| {
         with_player(|player| player.add_files_dialog());
     });
-    ui.on_next_theme(|| {
+    ui.on_toggle_sidebar(|| {
         with_player(|player| {
-            let index = (player.state.theme.unwrap_or(0) + 1) % theme::BUILTIN_COUNT;
-            player.state.theme = Some(index);
-            player.state.theme_name = None;
-            player.state.auto_theme = None;
-            player.fade = None;
-            player.look = theme::builtin_look(index);
-            theme::set_look(player.look);
+            player.sidebar_open = !player.sidebar_open;
+            player.stage_dirty = true;
+        });
+    });
+    ui.on_minimize(|| {
+        with_player(|player| {
+            if let Some(ui) = player.ui_weak.upgrade() { ui.window().set_minimized(true); }
+        });
+    });
+    ui.on_toggle_maximize(|| {
+        with_player(|player| {
+            player.maximized = !player.maximized;
+            let maximized = player.maximized;
+            if let Some(ui) = player.ui_weak.upgrade() {
+                ui.window().set_maximized(maximized);
+            }
+        });
+    });
+    ui.on_close_app(|| {
+        with_player(|player| {
+            player.persist();
+            if let Some(ui) = player.ui_weak.upgrade() {
+                slint::quit_event_loop().ok();
+                ui.hide().ok();
+            }
+        });
+    });
+    ui.on_toggle_settings(|| { with_player(|player| player.toggle_overlay(0)); });
+    ui.on_toggle_eq(|| { with_player(|player| player.toggle_overlay(1)); });
+    ui.on_open_download(|| { with_player(|player| player.toggle_overlay(2)); });
+    ui.on_toggle_visual_mode(|| { with_player(|player| player.cycle_visual_mode()); });
+    ui.on_play_index(|index| {
+        with_player(|player| {
+            let index = index as usize;
+            player.selected_track = Some(index);
+            player.play_index(index);
+            player.close_context();
+            player.save_if_due();
+        });
+    });
+    ui.on_select_track(|index| {
+        with_player(|player| {
+            player.selected_track = Some(index as usize);
+            player.track_ui_dirty = true;
+        });
+    });
+    ui.on_queue_next(|index| {
+        with_player(|player| {
+            player.queue_next(index as usize);
+            player.close_context();
+        });
+    });
+    ui.on_import_lrc(|index| {
+        with_player(|player| {
+            player.import_lrc(index as usize);
+            player.close_context();
+        });
+    });
+    ui.on_clear_lrc(|index| {
+        with_player(|player| {
+            player.clear_lrc(index as usize);
+            player.close_context();
+        });
+    });
+    ui.on_open_track_location(|index| {
+        with_player(|player| {
+            player.open_track_location(index as usize);
+            player.close_context();
+        });
+    });
+    ui.on_remove_track(|index| {
+        with_player(|player| {
+            player.remove_track_at(index as usize, false);
+            player.close_context();
+        });
+    });
+    ui.on_delete_track(|index| {
+        with_player(|player| {
+            let index = index as usize;
+            player.pending_delete = player.playlist.get(index).map(|track| track.path.clone());
+            player.close_context();
+        });
+    });
+    ui.on_confirm_delete(|| {
+        with_player(|player| {
+            if let Some(path) = player.pending_delete.take() {
+                if let Some(index) = player
+                    .playlist
+                    .iter()
+                    .position(|track| track.path == path)
+                {
+                    player.remove_track_at(index, true);
+                }
+            }
+        });
+    });
+    ui.on_cancel_delete(|| {
+        with_player(|player| player.pending_delete = None);
+    });
+    ui.on_open_context(|index, x, y| {
+        with_player(|player| {
+            let index = index as usize;
+            player.selected_track = Some(index);
+            player.track_ui_dirty = true;
+            CONTEXT_SLOT.with(|cell| {
+                *cell.borrow_mut() = Some((index, x, y));
+            });
+        });
+    });
+    ui.on_search_changed(|text| {
+        with_player(|player| {
+            player.search = text.to_string();
+            player.track_ui_dirty = true;
+            player.auto_scroll_target = None;
+        });
+    });
+    ui.on_scroll_to(|offset| {
+        with_player(|player| player.scroll_y = offset as f32);
+    });
+    ui.on_set_style(|style| { with_player(|player| player.set_style(style as u8)); });
+    ui.on_toggle_bg_spectrum(|| {
+        with_player(|player| {
+            player.state.show_bg_spectrum = !player.state.show_bg_spectrum;
+            player.stage_dirty = true;
             player.dirty = true;
         });
     });
-    ui.on_toggle_auto_theme(|| {
+    ui.on_toggle_radial(|| {
         with_player(|player| {
-            if player.state.auto_theme.is_some() {
+            player.state.show_radial = !player.state.show_radial;
+            player.stage_dirty = true;
+            player.dirty = true;
+        });
+    });
+    ui.on_toggle_core_pulse(|| {
+        with_player(|player| {
+            player.state.show_core_pulse = !player.state.show_core_pulse;
+            player.stage_dirty = true;
+            player.dirty = true;
+        });
+    });
+    ui.on_toggle_lyrics(|| {
+        with_player(|player| {
+            player.state.show_lyrics = !player.state.show_lyrics;
+            player.dirty = true;
+        });
+    });
+    ui.on_toggle_peak_hold(|| {
+        with_player(|player| {
+            player.state.peak_hold = !player.state.peak_hold;
+            player.stage_dirty = true;
+            player.dirty = true;
+        });
+    });
+    ui.on_adjust_radial_scale(|delta| {
+        with_player(|player| {
+            player.state.radial_scale = (player.state.radial_scale + delta)
+                .clamp(0.7, 1.2);
+            player.stage_dirty = true;
+            player.dirty = true;
+        });
+    });
+    ui.on_select_theme(|index| {
+        with_player(|player| {
+            let index = index as usize;
+            if let Some(entry) = player.library.entry(index) {
+                player.state.theme = entry.builtin;
+                player.state.theme_name = Some(entry.name.clone());
                 player.state.auto_theme = None;
                 player.fade = None;
-                player.look = player.resolve_look();
-                theme::set_look(player.look);
-            } else {
-                let dark = !theme::is_light();
-                player.state.auto_theme = Some(dark);
-                let mood = player.state.auto_mood.unwrap_or_default();
-                player.look = auto_theme::look(mood, dark);
-                theme::set_look(player.look);
+                player.look = entry.look;
+                theme::set_look(entry.look);
+                player.stage_dirty = true;
+                player.theme_ui_dirty = true;
+                player.dirty = true;
             }
+        });
+    });
+    ui.on_select_auto_theme(|dark| {
+        with_player(|player| {
+            player.state.auto_theme = Some(dark);
+            let mood = player.state.auto_mood.unwrap_or_default();
+            player.look = auto_theme::look(mood, dark);
+            theme::set_look(player.look);
+            player.stage_dirty = true;
+            player.theme_ui_dirty = true;
             player.dirty = true;
         });
     });
+    ui.on_reload_themes(|| {
+        with_player(|player| {
+            player.library.reload();
+            if let Some(name) = player.state.theme_name.clone() {
+                if player.library.find(&name).is_none() {
+                    player.state.theme_name = None;
+                    player.state.theme = Some(0);
+                }
+            }
+            player.look = player.resolve_look();
+            theme::set_look(player.look);
+            player.stage_dirty = true;
+            player.theme_ui_dirty = true;
+        });
+    });
+    ui.on_customize_theme(|| {
+        with_player(|player| {
+            let source = player
+                .state
+                .theme_name
+                .as_deref()
+                .and_then(|name| player.library.find(name));
+            if let Some(index) = source {
+                if let Some(new_index) = player.library.duplicate(index) {
+                    if let Some(entry) = player.library.entry(new_index) {
+                        player.state.theme = entry.builtin;
+                        player.state.theme_name = Some(entry.name.clone());
+                        player.state.auto_theme = None;
+                        player.look = entry.look;
+                        theme::set_look(entry.look);
+                        player.stage_dirty = true;
+                        player.theme_ui_dirty = true;
+                        player.error =
+                            Some("THEME EDITOR OPENS IN THE NEXT MILESTONE / COPY SAVED"
+                                .to_owned());
+                    }
+                }
+            }
+        });
+    });
+    ui.on_open_data_dir(|| {
+        with_player(|_player| {
+            let _ = std::process::Command::new("explorer")
+                .arg(storage::data_dir())
+                .spawn();
+        });
+    });
+    ui.on_set_band(|index, gain| {
+        with_player(|player| player.set_eq_band(index as usize, gain));
+    });
+    ui.on_cycle_eq_preset(|delta| {
+        with_player(|player| player.cycle_eq_preset(delta));
+    });
+    ui.on_toggle_eq_enabled(|| {
+        with_player(|player| {
+            player.state.eq_enabled = !player.state.eq_enabled;
+            player.apply_eq();
+            player.eq_ui_dirty = true;
+        });
+    });
+    ui.on_reset_eq(|| { with_player(|player| player.reset_eq()); });
+    ui.on_start_download(|| { with_player(|player| player.start_download()); });
+    ui.on_cancel_download(|| { with_player(|player| player.cancel_download()); });
+    ui.on_open_download_dir(|| {
+        with_player(|_player| {
+            let dir = storage::download_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::process::Command::new("explorer").arg(dir).spawn();
+        });
+    });
+    ui.on_use_env_proxy(|| {
+        with_player(|player| {
+            if let Some(env) = player.env_proxy.clone() {
+                player.state.proxy = env;
+                player.dirty = true;
+            }
+        });
+    });
+    ui.on_set_download_url(|text| {
+        with_player(|player| player.download_url = text.to_string());
+    });
+    ui.on_set_proxy(|text| {
+        with_player(|player| {
+            player.state.proxy = text.to_string();
+            player.dirty = true;
+        });
+    });
+    ui.on_clear_error(|| { with_player(|player| player.error = None); });
 
-    PLAYER.with(|cell| *cell.borrow_mut() = Some(player));
+    {
+        ui.set_download_url(player.download_url.clone().into());
+        ui.set_proxy_text(player.state.proxy.clone().into());
+        ui.set_state_path(storage::state_path().display().to_string().into());
+        ui.set_download_out_dir(storage::download_dir().display().to_string().into());
+        let mut shortcuts = slint::VecModel::<ShortcutRow>::default();
+        for (index, (keys, desc)) in [
+            ("SPACE", "播放 / 暂停"),
+            ("UP / DOWN", "音量 + / -"),
+            ("LEFT / RIGHT", "后退 / 前进 5 秒"),
+            ("PGUP / PGDN", "上一首 / 下一首"),
+            ("CTRL + LEFT/RIGHT", "上一首 / 下一首"),
+            ("CTRL + O", "添加音频"),
+            ("RIGHT-CLICK", "播放 / 导入 LRC / 删除"),
+            ("ESC", "关闭弹窗"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            shortcuts.push(ShortcutRow {
+                index: index as i32,
+                keys: (*keys).into(),
+                desc: (*desc).into(),
+            });
+        }
+        ui.set_shortcuts(slint::ModelRc::from(Rc::new(shortcuts)));
+    }
 
     let weak = ui.as_weak();
+    player.ui_weak = weak.clone();
+    PLAYER.with(|cell| *cell.borrow_mut() = Some(player));
     let timer = slint::Timer::default();
     timer.start(
         slint::TimerMode::Repeated,
@@ -980,7 +2106,17 @@ pub fn run(initial: Option<PathBuf>) {
     );
 
     ui.run().expect("slint event loop");
-    with_player(|player| player.persist());
+    // Tear down audio while the process is still fully alive. Dropping the
+    // cpal stream during TLS shutdown panics: Stream::drop joins its event
+    // thread, which no longer answers once LdrShutdownProcess begins.
+    PLAYER.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(mut player) = guard.take() {
+            player.persist();
+            player.engine.stop();
+            // `player` drops here, with the event loop still healthy.
+        }
+    });
 }
 
 /// Register the bundled TUI/pixel fonts with Slint's font collection so the
