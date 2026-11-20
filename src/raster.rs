@@ -231,6 +231,59 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    /// A matrix dot occupies an exact square of device pixels, even when its
+    /// centre falls between pixels. Snap once so every row/column has the same
+    /// size (the general rectangle rasterizer accepts fractional bounds).
+    pub fn pixel_square(&mut self, cx: f32, cy: f32, size: f32, color: Rgba) {
+        let size = size.round().max(1.0);
+        self.rect(
+            (cx - size * 0.5).round(),
+            (cy - size * 0.5).round(),
+            size,
+            size,
+            color,
+        );
+    }
+
+    /// A flat-ended radial cell. Unlike a capsule, its length excludes any
+    /// caps, so neighbouring cells retain their gap. Pixel-centre coverage
+    /// keeps the rotated square edges hard in the dot-matrix style.
+    pub fn radial_cell(
+        &mut self,
+        center: (f32, f32),
+        direction: (f32, f32),
+        length: f32,
+        width: f32,
+        color: Rgba,
+    ) {
+        if color.a == 0 || length <= 0.0 || width <= 0.0 {
+            return;
+        }
+        let (cx, cy) = center;
+        let (dx, dy) = direction;
+        let half_l = length * 0.5;
+        let half_w = width * 0.5;
+        let extent_x = dx.abs() * half_l + dy.abs() * half_w;
+        let extent_y = dy.abs() * half_l + dx.abs() * half_w;
+        let x0 = (cx - extent_x).floor().max(0.0) as usize;
+        let x1 = (cx + extent_x).ceil().min(self.width as f32) as usize;
+        let y0 = (cy - extent_y).floor().max(0.0) as usize;
+        let y1 = (cy + extent_y).ceil().min(self.height as f32) as usize;
+        for y in y0..y1 {
+            let py = y as f32 + 0.5 - cy;
+            self.blend_span(y, x0, x1, |x| {
+                let px = x - cx;
+                let along = px * dx + py * dy;
+                let across = -px * dy + py * dx;
+                if along >= -half_l && along < half_l && across >= -half_w && across < half_w {
+                    1.0
+                } else {
+                    0.0
+                }
+            }, color);
+        }
+    }
+
     /// Filled axis-aligned rectangle (grid cells).
     pub fn rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: Rgba) {
         if color.a == 0 {

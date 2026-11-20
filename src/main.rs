@@ -9,7 +9,6 @@ mod beat;
 mod beat_config;
 mod cache_store;
 mod decode;
-mod design;
 mod download;
 mod eq;
 mod lyrics;
@@ -40,6 +39,14 @@ fn main() {
     // switches to Slint's femtovg renderer for comparison.
     if !std::env::args().any(|arg| arg == "--gpu") {
         std::env::set_var("SLINT_BACKEND", "winit-software");
+    }
+
+    // The TUI is a pixel-grid design: force 1:1 logical-to-physical mapping so
+    // pixel fonts and the dot lattice land on whole device pixels instead of
+    // being anti-aliased across fractional DPI scales (125%/150% on Windows).
+    // Set SLINT_SCALE_FACTOR manually to override.
+    if std::env::var("SLINT_SCALE_FACTOR").is_err() {
+        std::env::set_var("SLINT_SCALE_FACTOR", "1");
     }
 
     let initial = std::env::args()

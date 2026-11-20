@@ -1,0 +1,219 @@
+import { Style, Theme } from "style.slint";
+
+// egui text_button: hover inverts into a solid text_hi block.
+export component InkBtn inherits Rectangle {
+    in property <string> label;
+    in property <length> text-size: Style.font-button;
+    callback clicked();
+    height: Style.control-h;
+    background: ta.has-hover ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        font-size: root.text-size;
+        color: ta.has-hover ? Theme.c-bg : Theme.c-text-hi;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// egui tui_button: same inversion, but the resting ink is text().
+export component TuiBtn inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+    height: Style.control-h;
+    background: ta.has-hover ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        font-size: Style.font-button;
+        color: ta.has-hover ? Theme.c-bg : Theme.c-text;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// egui tab_button (SYSTEM pages).
+export component TabBtn inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked();
+    height: Style.control-h;
+    background: ta.has-hover || root.active ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        font-size: Style.font-button;
+        color: ta.has-hover || root.active ? Theme.c-bg : Theme.c-text-dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// egui close_x_button.
+export component CloseX inherits Rectangle {
+    callback clicked();
+    width: Style.close-w;
+    height: Style.close-h;
+    background: ta.has-hover ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: "[x]";
+        font-size: Style.font-app-title;
+        color: ta.has-hover ? Theme.c-bg : Theme.c-text-hi;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// egui theme_chip: gradient preview, name, active border, bottom ink strip.
+export component ChipBtn inherits Rectangle {
+    in property <string> label;
+    in property <color> grad-a;
+    in property <color> grad-b;
+    in property <color> fg;
+    in property <color> dim;
+    in property <bool> active: false;
+    callback clicked();
+    height: Style.chip-h;
+    background: @linear-gradient(135deg, root.grad-a, root.grad-b);
+    border-width: root.active ? Style.stroke * 2 : Style.stroke;
+    border-color: root.active || ta.has-hover ? root.fg : root.dim;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        y: parent.height / 2 - self.height / 2 - Style.stroke;
+        width: parent.width - Style.space-lg;
+        x: Style.space-sm;
+        height: Style.font-caption + Style.space-xs;
+        text: root.label;
+        font-size: Style.font-caption;
+        color: root.fg;
+        overflow: elide;
+    }
+    Rectangle {
+        y: parent.height - Style.stroke * 3;
+        x: Style.stroke;
+        width: parent.width - Style.stroke * 2;
+        height: Style.stroke * 2;
+        background: root.fg;
+    }
+}
+
+// egui tui_menu_item.
+export component MenuRow inherits Rectangle {
+    in property <string> label;
+    in property <bool> danger: false;
+    callback clicked();
+    height: Style.menu-item-h;
+    background: ta.has-hover ? Theme.c-text-hi : transparent;
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => root.clicked();
+    }
+    Text {
+        x: Style.space-sm;
+        height: parent.height;
+        vertical-alignment: center;
+        text: ta.has-hover ? "> " + root.label : "  " + root.label;
+        font-size: Style.font-caption;
+        color: ta.has-hover ? Theme.c-bg : (root.danger ? Theme.c-danger : Theme.c-text);
+    }
+}
+
+// A shared ASCII meter. Glyph placement and pointer mapping use the same
+// Sarasa cell width, derived from text-size. The label sits outside the hit area.
+export component AsciiMeter inherits Rectangle {
+    in property <length> text-size: Style.font-dock-control;
+    in property <string> prefix: "[";
+    in property <int> prefix-cells: 1;
+    in property <int> cells: 1;
+    in property <int> filled: 0;
+    in property <string> fill-text;
+    in property <string> rest-text;
+    in property <string> label;
+    in property <length> label-gap: Style.dock-time-gap;
+    in property <color> ink: Theme.c-text-hi;
+    in property <color> label-ink: Theme.c-text;
+    in property <bool> commit-on-press: false;
+    out property <length> cell-w: text-size / 2;
+    property <length> track-x: prefix-cells * cell-w;
+    property <length> track-w: Math.max(cell-w, cells * cell-w);
+    property <float> pointer-position: Math.min(1.0, Math.max(0.0,
+        (ta.mouse-x - track-x) / track-w));
+    callback preview(float);
+    callback changed(float);
+    width: cell-w * (prefix-cells + cells + 1);
+    height: Style.field-h;
+    Text {
+        x: 0px;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.prefix;
+        font-size: root.text-size;
+        color: root.label-ink;
+    }
+    Text {
+        x: root.track-x;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.fill-text;
+        font-size: root.text-size;
+        color: root.ink;
+    }
+    Text {
+        x: root.track-x + root.filled * root.cell-w;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.rest-text;
+        font-size: root.text-size;
+        color: Theme.c-text-dim.with-alpha(0.43);
+    }
+    Text {
+        x: root.track-x + root.cells * root.cell-w;
+        height: parent.height;
+        vertical-alignment: center;
+        text: "]";
+        font-size: root.text-size;
+        color: root.label-ink;
+    }
+    Text {
+        x: parent.width + root.label-gap;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.label;
+        font-size: root.text-size;
+        color: root.label-ink;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        moved => root.preview(root.pointer-position);
+        pointer-event(e) => {
+            if (e.kind == (root.commit-on-press ? PointerEventKind.down : PointerEventKind.up)) {
+                root.changed(root.pointer-position);
+            }
+        }
+    }
+}

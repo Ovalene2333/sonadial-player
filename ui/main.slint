@@ -5,160 +5,9 @@
 // radial spectrum, core dial, beat ring) is painted by the CPU in src/stage.rs
 // and delivered as an opaque image.
 
-// Theme colors for the chrome, pushed from Rust every frame.
-export global Theme {
-    in-out property <color> c-bg;
-    in-out property <color> c-bg-deep;
-    in-out property <color> c-surface;
-    in-out property <color> c-line;
-    in-out property <color> c-text-hi;
-    in-out property <color> c-text;
-    in-out property <color> c-text-dim;
-    in-out property <color> c-danger;
-}
-
-// egui text_button: hover inverts into a solid text_hi block.
-component InkBtn inherits Rectangle {
-    in property <string> label;
-    in property <float> size: 12;
-    callback clicked();
-    height: 22px;
-    background: ta.has-hover ? Theme.c-text-hi : transparent;
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => root.clicked();
-    }
-    Text {
-        width: parent.width;
-        height: parent.height;
-        text: root.label;
-        font-size: root.size * 1px;
-        color: ta.has-hover ? Theme.c-bg : Theme.c-text-hi;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-}
-
-// egui tui_button: same inversion, but the resting ink is text().
-component TuiBtn inherits Rectangle {
-    in property <string> label;
-    callback clicked();
-    height: 22px;
-    background: ta.has-hover ? Theme.c-text-hi : transparent;
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => root.clicked();
-    }
-    Text {
-        width: parent.width;
-        height: parent.height;
-        text: root.label;
-        font-size: 12px;
-        color: ta.has-hover ? Theme.c-bg : Theme.c-text;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-}
-
-// egui tab_button (SYSTEM pages).
-component TabBtn inherits Rectangle {
-    in property <string> label;
-    in property <bool> active: false;
-    callback clicked();
-    height: 22px;
-    background: ta.has-hover || root.active ? Theme.c-text-hi : transparent;
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => root.clicked();
-    }
-    Text {
-        width: parent.width;
-        height: parent.height;
-        text: root.label;
-        font-size: 12px;
-        color: ta.has-hover || root.active ? Theme.c-bg : Theme.c-text-dim;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-}
-
-// egui close_x_button.
-component CloseX inherits Rectangle {
-    callback clicked();
-    width: 34px;
-    height: 24px;
-    background: ta.has-hover ? Theme.c-text-hi : transparent;
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => root.clicked();
-    }
-    Text {
-        width: parent.width;
-        height: parent.height;
-        text: "[x]";
-        font-size: 16px;
-        color: ta.has-hover ? Theme.c-bg : Theme.c-text-hi;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-    }
-}
-
-// egui theme_chip: gradient preview, name, active border, bottom ink strip.
-component ChipBtn inherits Rectangle {
-    in property <string> label;
-    in property <color> grad-a;
-    in property <color> grad-b;
-    in property <color> fg;
-    in property <color> dim;
-    in property <bool> active: false;
-    callback clicked();
-    height: 28px;
-    background: @linear-gradient(135deg, root.grad-a, root.grad-b);
-    border-width: root.active ? 2px : 1px;
-    border-color: root.active || ta.has-hover ? root.fg : root.dim;
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => root.clicked();
-    }
-    Text {
-        y: parent.height / 2 - self.height / 2 - 1px;
-        width: parent.width - 16px;
-        x: 8px;
-        height: 16px;
-        text: root.label;
-        font-size: 12px;
-        color: root.fg;
-        overflow: elide;
-    }
-    Rectangle {
-        y: parent.height - 3px;
-        x: 1px;
-        width: parent.width - 2px;
-        height: 2px;
-        background: root.fg;
-    }
-}
-
-// egui tui_menu_item.
-component MenuRow inherits Rectangle {
-    in property <string> label;
-    in property <bool> danger: false;
-    callback clicked();
-    height: 24px;
-    background: ta.has-hover ? Theme.c-text-hi : transparent;
-    ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => root.clicked();
-    }
-    Text {
-        x: 8px;
-        height: parent.height;
-        vertical-alignment: center;
-        text: ta.has-hover ? "> " + root.label : "  " + root.label;
-        font-size: 12px;
-        color: ta.has-hover ? Theme.c-bg : (root.danger ? Theme.c-danger : Theme.c-text);
-    }
-}
+import { Style, Theme } from "style.slint";
+export { Style, Theme }
+import { InkBtn, TuiBtn, TabBtn, CloseX, ChipBtn, MenuRow, AsciiMeter } from "widgets.slint";
 
 export struct TrackRow {
     index: int,
@@ -185,7 +34,7 @@ export struct ChipData {
 
 export struct ChipGroup {
     label: string,
-    offset: int,
+    rows: int,
     chips: [ChipData],
 }
 
@@ -202,28 +51,36 @@ export struct EqBandData {
 }
 
 export component Main inherits Window {
-    width: 1180px;
-    height: 760px;
+    // width/height here would freeze the Slint scene even after the native
+    // window maximizes. Preferred sizes only set the initial window size.
+    preferred-width: Style.window-w;
+    preferred-height: Style.window-h;
+    min-width: Style.window-min-w;
+    min-height: Style.window-min-h;
     title: "Sonadial Player";
-    default-font-family: "Sarasa Mono SC";
+    default-font-family: Style.family-ui;
+    default-font-size: Style.font-caption;
     no-frame: true;
-    resize-border-width: 6px;
+    resize-border-width: root.window-maximized ? 0px : Style.resize-border;
     background: Theme.c-bg;
 
     // ---------- geometry ----------
+    in-out property <bool> window-maximized: false;
     in-out property <bool> sidebar-open: true;
-    property <length> sidebar-w: root.sidebar-open ? 360px : 0px;
-    in-out property <length> stage-x: root.sidebar-w;
-    in-out property <length> stage-y: 44px;
-    in-out property <length> stage-w: root.width - root.sidebar-w;
-    in-out property <length> stage-h: root.height - 44px - 124px;
+    property <length> sidebar-w: root.sidebar-open ? Style.sidebar-w : 0px;
+    out property <length> stage-x: root.sidebar-w;
+    out property <length> stage-y: Style.topbar-h;
+    out property <length> stage-w: Math.max(1px, root.width - root.sidebar-w);
+    out property <length> stage-h: Math.max(1px, root.height - Style.topbar-h - Style.dock-h);
+
+    out property <length> library-viewport-h: Math.max(1px,
+        root.stage-h - Style.library-list-top - Style.space-sm);
+    out property <length> dock-content-w: Math.max(Style.dock-content-min-w,
+        root.width * Style.dock-content-fraction);
 
     // ---------- stage ----------
     in-out property <image> stage;
     in-out property <length> disc-r: 80px;
-    in-out property <length> grid-l: 100px;
-    in-out property <length> grid-r: 800px;
-    in-out property <length> grid-cx: 450px;
     in-out property <string> lyric-current: "";
     in-out property <string> lyric-next: "";
     in-out property <bool> lyric-active: false;
@@ -237,6 +94,7 @@ export component Main inherits Window {
     in-out property <float> scroll-y: 0;
     in-out property <float> scroll-max: 0;
     in-out property <int> current-cell: -1;
+    in-out property <int> selected-index: -1;
     in-out property <bool> scroll-active: false;
     in-out property <int> context-index: -1;
     in-out property <length> context-x: 0px;
@@ -257,11 +115,11 @@ export component Main inherits Window {
     in-out property <string> seek-rest-str: "";
     in-out property <string> time-text: "0:00 / 0:00";
     in-out property <string> play-label: "PLAY";
+    in-out property <string> core-status: "[STANDBY]";
     in-out property <string> vol-fill-str: "";
     in-out property <int> vol-filled: 0;
     in-out property <string> vol-rest-str: "";
     in-out property <string> vol-pct: " 62%";
-    property <length> seek-track-w: root.seek-cells * 13px;
 
     // ---------- overlays ----------
     in-out property <bool> show-settings: false;
@@ -287,6 +145,7 @@ export component Main inherits Window {
     in-out property <[ChipData]> auto-chips;
     in-out property <[ChipGroup]> theme-groups;
     in-out property <[ShortcutRow]> shortcuts;
+    in-out property <float> theme-content-h: 0;
 
     // ---------- eq ----------
     in-out property <[EqBandData]> eq-bands;
@@ -396,14 +255,22 @@ export component Main inherits Window {
                 root.next-track();
                 accept
             } else if (e.text == "Escape") {
+                // Overlays close through the Rust toggles: writing the
+                // properties here would be overwritten by the next frame push.
                 if (root.confirm-visible) {
                     root.cancel-delete();
                 } else if (root.error-visible) {
                     root.clear-error();
+                } else if (root.show-settings) {
+                    root.toggle-settings();
+                } else if (root.show-eq) {
+                    root.toggle-eq();
+                } else if (root.show-download) {
+                    root.open-download();
+                } else if (root.context-index >= 0) {
+                    root.context-index = -1;
                 } else {
-                    root.show-settings = false;
-                    root.show-eq = false;
-                    root.show-download = false;
+                    reject
                 }
                 accept
             } else {
@@ -419,86 +286,65 @@ export component Main inherits Window {
         y: 0;
         width: parent.width;
         height: parent.height;
+        image-fit: fill;
+        image-rendering: pixelated;
     }
 
-    // ============ stage labels ============
-    Text {
-        x: root.stage-x + 18px;
-        y: root.stage-y + 9px;
-        text: "SPECTRUM";
-        font-size: 12px;
-        color: Theme.c-text-dim;
-    }
-    Text {
-        x: root.stage-x + root.stage-w - self.width - 18px;
-        y: root.stage-y + 9px;
-        text: "FFT 1024";
-        font-size: 12px;
-        color: Theme.c-text-dim;
-    }
-    Text {
-        x: root.grid-l;
-        y: root.stage-y + root.stage-h - 14px;
-        text: "20HZ";
-        font-size: 9px;
-        color: Theme.c-text-dim;
-    }
-    Text {
-        x: root.grid-cx - self.width / 2;
-        y: root.stage-y + root.stage-h - 14px;
-        text: "8KHZ";
-        font-size: 9px;
-        color: Theme.c-text-dim;
-    }
-    Text {
-        x: root.grid-r - self.width;
-        y: root.stage-y + root.stage-h - 14px;
-        text: "20HZ";
-        font-size: 9px;
-        color: Theme.c-text-dim;
-    }
-
-    // Core dial hit area (status text ± 8px): click toggles playback.
+    // Core dial status: elapsed/total over [PLAYING]/[PAUSED]/[STANDBY],
+    // mirrored from the egui paint_core readout. Clicking the strip toggles
+    // playback.
+    property <length> core-cx: Math.round((root.stage-x + root.stage-w / 2) / 1px) * 1px;
+    property <length> core-cy: root.stage-y + root.stage-h / 2;
     Rectangle {
-        x: root.stage-x + root.stage-w / 2 - 60px;
-        y: root.stage-y + root.stage-h / 2 + root.disc-r * 0.30 - 16px;
-        width: 120px;
-        height: 32px;
+        x: root.core-cx - 90px;
+        y: root.core-cy - root.disc-r * 0.04 - 18px;
+        width: 180px;
+        height: root.disc-r * 0.34 + 40px;
         background: transparent;
         TouchArea {
             mouse-cursor: pointer;
             clicked => root.toggle-play();
         }
     }
-
-    // ============ lyrics (typewriter, top-left of stage) ============
-    prompt := Text {
-        visible: root.show-lyrics;
-        x: root.stage-x + 18px;
-        y: root.stage-y + 42px;
-        text: ">";
-        font-size: 16px;
-        color: root.lyric-active ? Theme.c-text : Theme.c-text-dim;
+    Text {
+        x: root.core-cx - 100px;
+        width: 200px;
+        y: root.core-cy - root.disc-r * 0.04 - self.height / 2;
+        text: root.time-text;
+        font-size: root.disc-r >= 56px ? Style.font-core : Style.font-caption;
+        color: Theme.c-text-hi;
+        horizontal-alignment: center;
     }
     Text {
+        x: root.core-cx - 100px;
+        width: 200px;
+        y: root.core-cy + root.disc-r * 0.30 - self.height / 2;
+        text: root.core-status;
+        font-size: Style.font-caption;
+        color: root.core-status == "[PLAYING]" ? Theme.c-text : Theme.c-text-dim;
+        horizontal-alignment: center;
+    }
+
+    // ============ lyrics (typewriter, top-left of stage) ============
+    Text {
         visible: root.show-lyrics;
-        x: prompt.x + prompt.preferred-width + 8px;
-        y: root.stage-y + 42px;
-        width: root.stage-x + root.stage-w - 18px - self.x;
+        x: root.stage-x + Style.lyric-inset;
+        y: root.stage-y + Style.lyric-current-y;
+        width: root.stage-x + root.stage-w - Style.lyric-inset - self.x;
         text: root.lyric-current;
-        font-family: "Fusion Pixel 12px Mono latin";
-        font-size: 16px;
+        font-family: Style.family-pixel;
+        font-size: Style.font-lyric;
         color: root.lyric-active ? Theme.c-text-hi : Theme.c-text-dim;
         overflow: elide;
     }
     Text {
         visible: root.show-lyrics;
-        x: prompt.x + prompt.preferred-width + 8px;
-        y: root.stage-y + 70px;
-        width: root.stage-x + root.stage-w - 18px - self.x;
+        x: root.stage-x + Style.lyric-inset;
+        y: root.stage-y + Style.lyric-next-y;
+        width: root.stage-x + root.stage-w - Style.lyric-inset - self.x;
         text: root.lyric-next;
-        font-family: "Fusion Pixel 12px Mono latin";
-        font-size: 12px;
+        font-family: Style.family-pixel;
+        font-size: Style.font-lyric-next;
         color: Theme.c-text-dim;
         overflow: elide;
     }
@@ -507,125 +353,117 @@ export component Main inherits Window {
     Rectangle {
         y: 0;
         width: parent.width;
-        height: 44px;
+        height: Style.topbar-h;
         Rectangle {
-            y: parent.height - 1px;
+            y: parent.height - Style.stroke;
             width: parent.width;
-            height: 1px;
+            height: Style.stroke;
             background: Theme.c-line;
         }
         InkBtn {
-            x: 10px;
-            y: 11px;
-            width: 30px;
-            size: 13;
+            x: Style.topbar-inset;
+            y: (parent.height - Style.control-h) / 2;
+            width: Style.topbar-toggle-w;
             label: "[=]";
             clicked => root.toggle-sidebar();
         }
         Text {
-            x: 50px;
+            x: Style.topbar-inset * 2 + Style.topbar-toggle-w;
             height: parent.height;
             vertical-alignment: center;
             text: "sonadial-player";
-            font-size: 15px;
+            font-size: Style.font-app-title;
             color: Theme.c-text-hi;
         }
         WindowMoveArea {
             x: 184px;
-            y: 4px;
+            y: Style.space-xs;
             width: parent.width - 184px - 420px;
             height: parent.height - 8px;
         }
-        InkBtn {
-            x: parent.width - 10px - 32px;
-            y: 11px;
-            width: 32px;
-            size: 13;
-            label: "[x]";
-            clicked => root.close-app();
-        }
-        InkBtn {
-            x: parent.width - 10px - 32px - 36px;
-            y: 11px;
-            width: 32px;
-            size: 13;
-            label: "[]";
-            clicked => root.toggle-maximize();
-        }
-        InkBtn {
-            x: parent.width - 10px - 32px - 72px;
-            y: 11px;
-            width: 32px;
-            size: 13;
-            label: "-";
-            clicked => root.minimize();
-        }
-        InkBtn {
-            x: parent.width - 10px - 32px - 72px - 42px - 38px;
-            y: 11px;
-            width: 38px;
-            label: "SYS";
-            clicked => root.toggle-settings();
-        }
-        InkBtn {
-            x: parent.width - 10px - 32px - 72px - 42px - 38px - 38px - 34px;
-            y: 11px;
-            width: 34px;
-            label: "EQ";
-            clicked => root.toggle-eq();
-        }
-        InkBtn {
-            x: parent.width - 10px - 32px - 72px - 42px - 38px - 38px - 34px - 62px - 58px;
-            y: 11px;
-            width: 58px;
-            label: "[MODE]";
-            clicked => root.toggle-visual-mode();
+        HorizontalLayout {
+            x: parent.width - Style.topbar-inset - Style.topbar-actions-w;
+            y: (parent.height - Style.control-h) / 2;
+            width: Style.topbar-actions-w;
+            height: Style.control-h;
+            spacing: Style.space-tight;
+            InkBtn {
+                width: Style.topbar-mode-w;
+                label: "[MODE]";
+                clicked => root.toggle-visual-mode();
+            }
+            InkBtn {
+                width: Style.topbar-eq-w;
+                label: "EQ";
+                clicked => root.toggle-eq();
+            }
+            InkBtn {
+                width: Style.topbar-system-w;
+                label: "SYS";
+                clicked => root.toggle-settings();
+            }
+            InkBtn {
+                width: Style.topbar-window-button-w;
+                label: "-";
+                clicked => root.minimize();
+            }
+            InkBtn {
+                width: Style.topbar-window-button-w;
+                label: root.window-maximized ? "[=]" : "[]";
+                clicked => root.toggle-maximize();
+            }
+            InkBtn {
+                width: Style.topbar-window-button-w;
+                label: "[x]";
+                clicked => root.close-app();
+            }
         }
     }
 
     // ============ sidebar ============
     Rectangle {
         x: 0;
-        y: 44px;
+        y: Style.topbar-h;
         width: root.sidebar-w;
-        height: parent.height - 44px - 124px;
+        height: root.stage-h;
         visible: root.sidebar-open;
         Rectangle {
-            x: parent.width - 1px;
-            width: 1px;
+            x: parent.width - Style.stroke;
+            width: Style.stroke;
             height: parent.height;
             background: Theme.c-line;
         }
         Text {
-            x: 14px;
-            y: 6px;
+            x: Style.library-inset;
+            y: Style.space-tight;
             text: "LIBRARY";
-            font-size: 14px;
+            font-size: Style.font-library;
             color: Theme.c-text-hi;
         }
         Text {
-            x: parent.width - self.width - 14px;
-            y: 8px;
+            x: parent.width - self.width - Style.library-inset;
+            y: Style.space-sm;
             text: (root.track-count < 10 ? "0" : "") + root.track-count + " TRACKS";
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim;
         }
         Text {
-            x: 14px;
-            y: 34px;
-            height: 20px;
+            x: Style.library-inset;
+            y: Style.library-search-y;
+            height: Style.field-h;
             vertical-alignment: center;
             text: "find:";
-            font-size: 13px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim;
         }
         TextInput {
-            x: 62px;
-            y: 34px;
-            width: parent.width - 76px;
-            height: 20px;
+            x: Style.library-search-x;
+            y: Style.library-search-y;
+            width: parent.width - Style.library-search-x - Style.library-inset;
+            height: Style.field-h;
             single-line: true;
-            font-size: 13px;
+            font-family: Style.family-pixel;
+            font-size: Style.font-pixel-caption;
             color: Theme.c-text-hi;
             vertical-alignment: center;
             text <=> root.search-text;
@@ -633,19 +471,20 @@ export component Main inherits Window {
         }
         Text {
             visible: root.search-text == "";
-            x: 62px;
-            y: 34px;
-            height: 20px;
+            x: Style.library-search-x;
+            y: Style.library-search-y;
+            height: Style.field-h;
             vertical-alignment: center;
             text: "title...";
-            font-size: 13px;
+            font-family: Style.family-pixel;
+            font-size: Style.font-pixel-caption;
             color: Theme.c-text-dim.with-alpha(0.55);
         }
         Rectangle {
-            x: 14px;
-            y: 62px;
-            width: 74px;
-            height: 22px;
+            x: Style.library-inset;
+            y: Style.library-actions-y;
+            width: Style.library-add-w;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: "[ add ]";
@@ -653,10 +492,10 @@ export component Main inherits Window {
             }
         }
         Rectangle {
-            x: 88px;
-            y: 62px;
-            width: 132px;
-            height: 22px;
+            x: Style.library-inset + Style.library-add-w;
+            y: Style.library-actions-y;
+            width: Style.library-mode-w;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: "[ mode: " + root.mode-short + " ]";
@@ -664,10 +503,10 @@ export component Main inherits Window {
             }
         }
         Rectangle {
-            x: 220px;
-            y: 62px;
-            width: 90px;
-            height: 22px;
+            x: Style.library-inset + Style.library-add-w + Style.library-mode-w;
+            y: Style.library-actions-y;
+            width: Style.library-download-w;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: "[ download ]";
@@ -675,67 +514,83 @@ export component Main inherits Window {
             }
         }
         Rectangle {
-            x: 14px;
-            y: 95px;
-            width: parent.width - 28px;
-            height: 1px;
+            x: Style.library-inset;
+            y: Style.library-separator-y;
+            width: parent.width - Style.library-inset * 2;
+            height: Style.stroke;
             background: Theme.c-line;
         }
         // Track list: manual clip + offset so the custom TUI scrollbar stays exact.
-        property <length> list-top: 103px;
-        property <length> list-h: self.height - 103px - 8px;
+        property <length> list-top: Style.library-list-top;
+        property <length> list-h: root.library-viewport-h;
         Rectangle {
-            x: 8px;
+            x: Style.library-list-inset;
             y: list-top;
-            width: parent.width - 22px;
+            width: parent.width - Style.library-list-right;
             height: list-h;
             clip: true;
+            // Wheel scrolling over the empty space behind the rows.
+            TouchArea {
+                scroll-event(e) => {
+                    root.scroll-to(Math.max(0.0, Math.min(root.scroll-max,
+                        root.scroll-y - e.delta-y / 1px)));
+                    accept
+                }
+            }
             for row[i] in root.tracks: Rectangle {
-                y: i * 26px - root.scroll-y * 1px;
+                y: i * Style.row-h - root.scroll-y * 1px;
                 width: parent.width;
-                height: 26px;
+                height: Style.row-h;
+                // Inverse video only for the playing row; a single click just
+                // draws a wireframe, matching the terminal look.
                 background: row.selected ? Theme.c-text-hi : transparent;
-                border-width: row.focused ? 1px : 0px;
-                border-color: row.selected ? Theme.c-bg : Theme.c-text-hi;
+                border-width: root.selected-index == row.index || (!row.selected && ta.has-hover) ? Style.stroke : 0px;
+                border-color: row.selected ? Theme.c-bg
+                    : (root.selected-index == row.index ? Theme.c-text-hi : Theme.c-text-hi.with-alpha(0.47));
                 ta := TouchArea {
                     mouse-cursor: pointer;
                     clicked => root.select-track(row.index);
                     double-clicked => root.play-index(row.index);
                     pointer-event(e) => {
                         if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
-                            root.open-context(row.index, (8px + self.mouse-x) / 1px, (103px + i * 26px - root.scroll-y * 1px + 26px) / 1px);
+                            root.open-context(row.index, (Style.library-list-inset + self.mouse-x) / 1px, (list-top + (i + 1) * Style.row-h - root.scroll-y * 1px) / 1px);
                         }
+                    }
+                    scroll-event(e) => {
+                        root.scroll-to(Math.max(0.0, Math.min(root.scroll-max,
+                            root.scroll-y - e.delta-y / 1px)));
+                        accept
                     }
                 }
                 Text {
-                    x: 4px;
+                    x: Style.space-xs;
                     height: parent.height;
                     vertical-alignment: center;
                     text: (row.selected ? "> " : "   ")
                         + (row.index + 1 >= 10 ? row.index + 1 : "0" + (row.index + 1))
                         + (row.playing ? "*" : " ") + (row.has-lrc ? "L" : " ");
-                    font-size: 13px;
+                    font-size: Style.font-library;
                     color: row.selected ? Theme.c-bg : Theme.c-text-dim;
                 }
                 Text {
-                    x: 58px;
-                    width: parent.width - 58px - 84px;
+                    x: Style.library-title-x;
+                    width: parent.width - Style.library-title-x - Style.library-meta-reserve;
                     height: parent.height;
                     vertical-alignment: center;
                     text: row.title;
-                    font-family: "Fusion Pixel 12px Mono latin";
-                    font-size: 13px;
+                    font-family: Style.family-title;
+                    font-size: Style.font-track-title;
                     color: row.selected ? Theme.c-bg : Theme.c-text;
                     overflow: elide;
                 }
                 Text {
-                    x: parent.width - 80px;
-                    width: 68px;
+                    x: parent.width - Style.library-meta-right;
+                    width: Style.library-meta-w;
                     height: parent.height;
                     vertical-alignment: center;
                     horizontal-alignment: right;
                     text: row.meta;
-                    font-size: 12px;
+                    font-size: Style.font-caption;
                     color: row.selected ? Theme.c-text-dim : Theme.c-text-dim;
                 }
             }
@@ -743,40 +598,40 @@ export component Main inherits Window {
                 width: parent.width;
                 height: list-h;
                 Text {
-                    x: 6px;
-                    y: 12px;
+                    x: Style.space-tight;
+                    y: Style.space-md;
                     text: "no tracks";
-                    font-size: 13px;
+                    font-size: Style.font-library;
                     color: Theme.c-text-dim;
                 }
                 Text {
-                    x: 6px;
+                    x: Style.space-tight;
                     y: 36px;
                     text: "drop audio or ctrl+o";
-                    font-size: 12px;
+                    font-size: Style.font-caption;
                     color: Theme.c-text-dim;
                 }
             }
         }
         // TUI scrollbar: '-' track, '#' thumb, '@' on the current row.
         property <bool> near: probe.has-hover || thumbdrag.has-hover || thumbdrag.pressed;
-        property <int> cells: Math.max(1, Math.floor(list-h / 13px));
+        property <int> cells: Math.max(1, Math.floor(list-h / Style.scroll-cell-h));
         property <float> frac: root.scroll-max > 0.5
             ? Math.min(1.0, Math.max(0.0, root.scroll-y / root.scroll-max)) : 0.0;
         property <int> thumb-cells: Math.min(cells,
-            Math.max(1, Math.round(list-h / Math.max(26px, root.tracks.length * 26px) * cells)));
+            Math.max(1, Math.round(list-h / Math.max(Style.row-h, root.tracks.length * Style.row-h) * cells)));
         property <int> thumb-start: Math.max(0, Math.min(self.cells - self.thumb-cells,
             Math.round((self.cells - self.thumb-cells) * frac)));
         for i in cells: Text {
             x: parent.width - 12px;
             width: 12px;
-            height: 13px;
-            y: list-top + i * 13px;
+            height: Style.scroll-cell-h;
+            y: list-top + i * Style.scroll-cell-h;
             vertical-alignment: center;
             horizontal-alignment: center;
             text: root.current-cell == i ? "@"
                 : (i >= thumb-start && i < thumb-start + thumb-cells ? "#" : "-");
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: root.current-cell == i ? Theme.c-text-hi
                 : (i >= thumb-start && i < thumb-start + thumb-cells
                     ? (root.scroll-active ? Theme.c-text-hi
@@ -784,9 +639,9 @@ export component Main inherits Window {
                     : Theme.c-text-dim.with-alpha(near ? 0.43 : 0.14));
         }
         thumbdrag := TouchArea {
-            x: parent.width - 14px;
-            y: 103px;
-            width: 14px;
+            x: parent.width - Style.scroll-w;
+            y: list-top;
+            width: Style.scroll-w;
             height: list-h;
             mouse-cursor: ns-resize;
             moved => {
@@ -801,362 +656,303 @@ export component Main inherits Window {
                     root.scroll-to(Math.min(1.0, Math.max(0.0, self.mouse-y / list-h)) * root.scroll-max);
                 }
             }
+            scroll-event(e) => {
+                root.scroll-to(Math.max(0.0, Math.min(root.scroll-max,
+                    root.scroll-y - e.delta-y / 1px)));
+                accept
+            }
         }
         probe := TouchArea {
-            x: parent.width - 42px;
-            y: 103px;
-            width: 28px;
+            x: parent.width - Style.scroll-w * 3;
+            y: list-top;
+            width: Style.scroll-w * 2;
             height: list-h;
-        }
-        // Right-click context menu (positioned over the clicked row).
-        if (root.context-index >= 0): TouchArea {
-            width: 100%;
-            height: 100%;
-            clicked => { root.context-index = -1; }
-        }
-        if (root.context-index >= 0): Rectangle {
-            x: Math.min(root.context-x, parent.width - 236px);
-            y: Math.min(root.context-y, parent.height - 230px);
-            width: 232px;
-            background: Theme.c-bg;
-            border-width: 1px;
-            border-color: Theme.c-text-hi;
-            Rectangle {
-                x: 0px;
-                y: 0px;
-                width: parent.width;
-                height: 28px;
-                Text {
-                    x: 8px;
-                    y: 0px;
-                    width: parent.width - 16px;
-                    height: parent.height;
-                    vertical-alignment: center;
-                    text: "  " + root.context-title;
-                    font-size: 12px;
-                    color: Theme.c-text-hi;
-                    overflow: elide;
-                }
-                Rectangle {
-                    y: parent.height - 1px;
-                    width: parent.width;
-                    height: 1px;
-                    background: Theme.c-line;
-                }
+            scroll-event(e) => {
+                root.scroll-to(Math.max(0.0, Math.min(root.scroll-max,
+                    root.scroll-y - e.delta-y / 1px)));
+                accept
             }
-            Rectangle {
-                x: 1px;
-                y: 32px;
-                width: parent.width - 2px;
-                height: 152px;
-                MenuRow {
-                    x: 0px;
-                    y: 0px;
-                    width: parent.width;
-                    label: "PLAY";
-                    clicked => root.play-index(root.context-index);
-                }
-                MenuRow {
-                    x: 0px;
-                    y: 24px;
-                    width: parent.width;
-                    label: "PLAY NEXT";
-                    clicked => root.queue-next(root.context-index);
-                }
-                MenuRow {
-                    x: 0px;
-                    y: 48px;
-                    width: parent.width;
-                    label: root.context-has-lrc ? "REPLACE LRC..." : "IMPORT LRC...";
-                    clicked => root.import-lrc(root.context-index);
-                }
-                if (root.context-has-lrc): MenuRow {
-                    x: 0px;
-                    y: 72px;
-                    width: parent.width;
-                    label: "CLEAR LRC";
-                    clicked => root.clear-lrc(root.context-index);
-                }
-                MenuRow {
-                    x: 0px;
-                    y: root.context-has-lrc ? 96px : 72px;
-                    width: parent.width;
-                    label: "OPEN LOCATION";
-                    clicked => root.open-track-location(root.context-index);
-                }
-                Rectangle {
-                    y: root.context-has-lrc ? 122px : 98px;
-                    x: 8px;
-                    width: parent.width - 16px;
-                    height: 1px;
-                    background: Theme.c-line;
-                }
-                MenuRow {
-                    x: 0px;
-                    y: root.context-has-lrc ? 126px : 102px;
-                    width: parent.width;
-                    label: "REMOVE FROM LIST";
-                    clicked => root.remove-track(root.context-index);
-                }
-                MenuRow {
-                    x: 0px;
-                    y: root.context-has-lrc ? 150px : 126px;
-                    width: parent.width;
-                    label: "DELETE FILE...";
-                    danger: true;
-                    clicked => root.delete-track(root.context-index);
-                }
-            }
-            // Click-away catcher.
-            TouchArea { }
         }
     }
 
     // ============ dock ============
     Rectangle {
-        y: parent.height - 124px;
+        y: parent.height - Style.dock-h;
         width: parent.width;
-        height: 124px;
+        height: Style.dock-h;
         Rectangle {
             y: 0;
             width: parent.width;
-            height: 1px;
+            height: Style.stroke;
             background: Theme.c-line;
         }
         Text {
-            x: 16px;
-            y: 18px;
-            width: parent.width * 0.55;
+            x: Style.dock-inset;
+            y: Style.dock-title-y;
+            width: root.dock-content-w;
+            height: Style.dock-title-h;
+            vertical-alignment: center;
             text: root.dock-title;
-            font-family: "Fusion Pixel 12px Mono latin";
-            font-size: 15px;
+            font-family: Style.family-title;
+            font-size: Style.font-dock-title;
             color: root.dock-title-live ? Theme.c-text-hi : Theme.c-text-dim;
             overflow: elide;
         }
         Text {
-            x: 16px;
-            y: 38px;
+            x: Style.dock-inset;
+            y: Style.dock-meta-y;
             text: root.meta-prefix + root.meta-output;
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim;
         }
         Text {
-            x: parent.width - self.width - 16px;
-            y: 38px;
+            x: parent.width - self.width - Style.dock-inset;
+            y: Style.dock-meta-y;
             text: root.mode-text;
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim;
         }
-        // ASCII seek bar: [###---] time — text boxes are 20px tall, centred ink.
-        property <length> bar-y: 54px;
-        property <length> track-left: 16px + 13px;
-        Text {
-            x: 16px;
-            y: bar-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: "[";
-            font-size: 13px;
-            color: Theme.c-text-dim;
+        AsciiMeter {
+            x: Style.dock-inset;
+            y: Style.dock-seek-y;
+            height: Style.dock-seek-h;
+            cells: root.seek-cells;
+            filled: root.seek-filled;
+            fill-text: root.seek-filled-str;
+            rest-text: root.seek-rest-str;
+            label: root.time-text;
+            preview(position) => root.seek-preview(position);
+            changed(position) => root.seek(position);
         }
-        Text {
-            x: track-left;
-            y: bar-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: root.seek-filled-str;
-            font-size: 13px;
-            color: Theme.c-text-hi;
+        AsciiMeter {
+            x: Style.dock-inset;
+            y: Style.dock-controls-y;
+            height: Style.dock-controls-h;
+            prefix: "VOL [";
+            prefix-cells: 5;
+            cells: Style.dock-volume-cells;
+            filled: root.vol-filled;
+            fill-text: root.vol-fill-str;
+            rest-text: root.vol-rest-str;
+            label: root.vol-pct;
+            label-gap: self.cell-w;
+            ink: Theme.c-text;
+            commit-on-press: true;
+            preview(position) => root.set-volume(position * Style.volume-max);
+            changed(position) => root.set-volume(position * Style.volume-max);
         }
-        Text {
-            x: track-left + root.seek-filled * 13px;
-            y: bar-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: root.seek-rest-str;
-            font-size: 13px;
-            color: Theme.c-text-dim.with-alpha(0.43);
-        }
-        Text {
-            x: track-left + root.seek-cells * 13px;
-            y: bar-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: "]";
-            font-size: 13px;
-            color: Theme.c-text-dim;
-        }
-        Text {
-            x: track-left + root.seek-cells * 13px + 10px;
-            y: bar-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: root.time-text;
-            font-size: 13px;
-            color: Theme.c-text-dim;
-        }
-        TouchArea {
-            x: 16px;
-            y: bar-y;
-            width: root.seek-cells * 13px + 26px;
-            height: 20px;
-            mouse-cursor: pointer;
-            moved => {
-                root.seek-preview(Math.min(1.0, Math.max(0.0, (self.mouse-x - 13px) / (root.seek-cells * 13px))));
-            }
-            pointer-event(e) => {
-                if (e.kind == PointerEventKind.up) {
-                    root.seek(Math.min(1.0, Math.max(0.0, (self.mouse-x - 13px) / (root.seek-cells * 13px))));
-                }
-            }
-        }
-        // ASCII volume: VOL [####----] nnn%
-        property <length> vol-y: 80px;
-        Text {
-            x: 16px;
-            y: vol-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: "VOL [";
-            font-size: 12px;
-            color: Theme.c-text-dim;
-        }
-        Text {
-            x: 16px + 60px;
-            y: vol-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: root.vol-fill-str;
-            font-size: 12px;
-            color: Theme.c-text;
-        }
-        Text {
-            x: 16px + 60px + root.vol-filled * 12px;
-            y: vol-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: root.vol-rest-str;
-            font-size: 12px;
-            color: Theme.c-text-dim.with-alpha(0.43);
-        }
-        Text {
-            x: 16px + 252px;
-            y: vol-y;
-            height: 20px;
-            vertical-alignment: center;
-            text: "] " + root.vol-pct;
-            font-size: 12px;
-            color: Theme.c-text-dim;
-        }
-        TouchArea {
-            x: 16px;
-            y: vol-y;
-            width: 324px;
-            height: 20px;
-            mouse-cursor: pointer;
-            moved => {
-                root.set-volume(Math.min(1.0, Math.max(0.0, self.mouse-x / 324px)) * 1.25);
-            }
-            pointer-event(e) => {
-                if (e.kind == PointerEventKind.down) {
-                    root.set-volume(Math.min(1.0, Math.max(0.0, self.mouse-x / 324px)) * 1.25);
-                }
-            }
-        }
-        // Transport buttons, centred like the egui dock.
         HorizontalLayout {
-            x: (parent.width - 310px) / 2;
-            y: parent.height - 31px;
-            width: 310px;
-            height: 22px;
-            spacing: 8px;
+            x: Math.round((parent.width - Style.dock-transport-w) / 2 / 1px) * 1px;
+            y: Style.dock-controls-y;
+            width: Style.dock-transport-w;
+            height: Style.dock-controls-h;
+            spacing: Style.dock-button-gap;
             InkBtn {
-                width: 64px;
+                width: Style.dock-button-w;
+                height: Style.dock-controls-h;
+                text-size: Style.font-dock-control;
                 label: "< PREV";
                 clicked => root.prev-track();
             }
             InkBtn {
-                width: 64px;
+                width: Style.dock-button-w;
+                height: Style.dock-controls-h;
+                text-size: Style.font-dock-control;
                 label: root.play-label;
                 clicked => root.toggle-play();
             }
             InkBtn {
-                width: 58px;
+                width: Style.dock-stop-w;
+                height: Style.dock-controls-h;
+                text-size: Style.font-dock-control;
                 label: "STOP";
                 clicked => root.stop();
             }
             InkBtn {
-                width: 64px;
+                width: Style.dock-button-w;
+                height: Style.dock-controls-h;
+                text-size: Style.font-dock-control;
                 label: "NEXT >";
                 clicked => root.next-track();
             }
         }
     }
 
+    // ============ right-click context menu ============
+    // Lives at window level so a click anywhere (dock, stage) dismisses it.
+    if (root.context-index >= 0): TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.context-index = -1; }
+    }
+    if (root.context-index >= 0): Rectangle {
+        x: Math.max(4px, Math.min(root.context-x, root.sidebar-w - Style.menu-w - Style.space-xs));
+        y: Math.max(4px, Math.min(root.context-y + Style.topbar-h, parent.height - Style.menu-body-y - Style.menu-item-h * 7 - Style.menu-divider-gap - Style.space-tight));
+        height: Style.menu-body-y + (root.context-has-lrc ? 7 : 6) * Style.menu-item-h + Style.menu-divider-gap + Style.space-xxs;
+        width: Style.menu-w;
+        background: Theme.c-bg;
+        border-width: Style.stroke;
+        border-color: Theme.c-text-hi;
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: Style.menu-header-h;
+            Text {
+                x: Style.space-sm;
+                y: 0px;
+                width: parent.width - Style.space-sm * 2;
+                height: parent.height;
+                vertical-alignment: center;
+                text: "  " + root.context-title;
+                font-size: Style.font-caption;
+                color: Theme.c-text-hi;
+                overflow: elide;
+            }
+            Rectangle {
+                y: parent.height - Style.stroke;
+                width: parent.width;
+                height: Style.stroke;
+                background: Theme.c-line;
+            }
+        }
+        Rectangle {
+            x: 1px;
+            y: Style.menu-body-y;
+            width: parent.width - Style.stroke * 2;
+            height: (root.context-has-lrc ? 7 : 6) * Style.menu-item-h + Style.menu-divider-gap + Style.space-xxs;
+            MenuRow {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                label: "PLAY";
+                clicked => root.play-index(root.context-index);
+            }
+            MenuRow {
+                x: 0px;
+                y: Style.menu-item-h * 1;
+                width: parent.width;
+                label: "PLAY NEXT";
+                clicked => root.queue-next(root.context-index);
+            }
+            MenuRow {
+                x: 0px;
+                y: Style.menu-item-h * 2;
+                width: parent.width;
+                label: root.context-has-lrc ? "REPLACE LRC..." : "IMPORT LRC...";
+                clicked => root.import-lrc(root.context-index);
+            }
+            if (root.context-has-lrc): MenuRow {
+                x: 0px;
+                y: Style.menu-item-h * 3;
+                width: parent.width;
+                label: "CLEAR LRC";
+                clicked => root.clear-lrc(root.context-index);
+            }
+            MenuRow {
+                x: 0px;
+                y: (root.context-has-lrc ? 4 : 3) * Style.menu-item-h;
+                width: parent.width;
+                label: "OPEN LOCATION";
+                clicked => root.open-track-location(root.context-index);
+            }
+            Rectangle {
+                y: (root.context-has-lrc ? 5 : 4) * Style.menu-item-h + Style.space-xxs;
+                x: Style.space-sm;
+                width: parent.width - Style.space-sm * 2;
+                height: Style.stroke;
+                background: Theme.c-line;
+            }
+            MenuRow {
+                x: 0px;
+                y: (root.context-has-lrc ? 5 : 4) * Style.menu-item-h + Style.menu-divider-gap;
+                width: parent.width;
+                label: "REMOVE FROM LIST";
+                clicked => root.remove-track(root.context-index);
+            }
+            MenuRow {
+                x: 0px;
+                y: (root.context-has-lrc ? 6 : 5) * Style.menu-item-h + Style.menu-divider-gap;
+                width: parent.width;
+                label: "DELETE FILE...";
+                danger: true;
+                clicked => root.delete-track(root.context-index);
+            }
+        }
+    }
+
     // ============ SYSTEM overlay ============
+    // Modal: click anywhere outside the panel closes it.
+    if (root.show-settings): TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.toggle-settings(); }
+    }
     if (root.show-settings): Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        width: 470px;
-        height: 440px;
+        width: Style.settings-w;
+        height: Style.settings-h;
         background: Theme.c-bg;
-        border-width: 1px;
+        border-width: Style.stroke;
         border-color: Theme.c-text-hi;
+        // Swallow clicks inside the panel so they do not fall through.
+        TouchArea { }
         HorizontalLayout {
-            x: 20px;
-            y: 14px;
-            width: parent.width - 74px;
-            height: 22px;
+            x: Style.panel-inset;
+            y: Style.panel-heading-y;
+            width: parent.width - Style.panel-inset * 2 - Style.close-w;
+            height: Style.control-h;
             spacing: 0px;
             TabBtn {
-                width: 118px;
+                width: Style.panel-tab-w;
                 label: "[ SYSTEM ]";
                 active: root.settings-page == 0;
                 clicked => { root.settings-page = 0; }
             }
             TabBtn {
-                width: 118px;
+                width: Style.panel-tab-w;
                 label: "[ VISUALS ]";
                 active: root.settings-page == 1;
                 clicked => { root.settings-page = 1; }
             }
             TabBtn {
-                width: 118px;
+                width: Style.panel-tab-w;
                 label: "[ THEME ]";
                 active: root.settings-page == 2;
                 clicked => { root.settings-page = 2; }
             }
         }
         CloseX {
-            x: parent.width - 54px;
-            y: 13px;
-            clicked => { root.show-settings = false; }
+            x: parent.width - Style.panel-inset - Style.close-w;
+            y: Style.panel-close-y;
+            clicked => { root.toggle-settings(); }
         }
         if (root.settings-page == 0): Rectangle {
-            x: 20px;
-            y: 48px;
-            width: parent.width - 40px;
-            height: parent.height - 68px;
+            x: Style.panel-inset;
+            y: Style.panel-body-y;
+            width: parent.width - Style.panel-inset * 2;
+            height: parent.height - Style.panel-body-y - Style.panel-inset;
             Text {
                 x: 0px;
                 y: 0px;
                 width: parent.width;
                 text: "SONADIAL PLAYER";
-                font-size: 24px;
+                font-size: Style.font-heading;
                 color: Theme.c-text-hi;
             }
             Text {
                 x: 0px;
                 y: 34px;
                 text: "v0.1 / " + root.track-count + " TRACKS / " + root.mode-long;
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
             }
             Text {
                 x: 0px;
                 y: 58px;
                 text: "OUTPUT  " + root.out-label;
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text;
                 overflow: elide;
             }
@@ -1164,14 +960,14 @@ export component Main inherits Window {
                 x: 0px;
                 y: 78px;
                 width: parent.width;
-                height: 1px;
+                height: Style.stroke;
                 background: Theme.c-line;
             }
             Text {
                 x: 0px;
                 y: 84px;
                 text: "STATE  " + root.state-path;
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text;
                 overflow: elide;
             }
@@ -1179,20 +975,23 @@ export component Main inherits Window {
                 x: 0px;
                 y: 110px;
                 text: "SHORTCUTS";
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
             }
             for sc in root.shortcuts: Rectangle {
                 x: 0px;
-                y: 132px + sc.index * 18px;
+                y: 132px + sc.index * Style.line-h;
                 width: parent.width;
-                height: 18px;
+                height: Style.line-h;
                 Text {
+                    // x must be explicit: Slint centres non-layout children
+                    // that leave x unset.
+                    x: 0px;
                     width: 150px;
                     height: parent.height;
                     vertical-alignment: center;
                     text: sc.keys;
-                    font-size: 12px;
+                    font-size: Style.font-caption;
                     color: Theme.c-text-hi;
                 }
                 Text {
@@ -1201,7 +1000,7 @@ export component Main inherits Window {
                     height: parent.height;
                     vertical-alignment: center;
                     text: sc.desc;
-                    font-size: 12px;
+                    font-size: Style.font-caption;
                     color: Theme.c-text;
                     overflow: elide;
                 }
@@ -1215,30 +1014,30 @@ export component Main inherits Window {
             }
         }
         if (root.settings-page == 1): Rectangle {
-            x: 20px;
-            y: 48px;
-            width: parent.width - 40px;
-            height: parent.height - 68px;
+            x: Style.panel-inset;
+            y: Style.panel-body-y;
+            width: parent.width - Style.panel-inset * 2;
+            height: parent.height - Style.panel-body-y - Style.panel-inset;
             Text {
                 x: 0px;
                 y: 0px;
                 width: parent.width;
                 text: "VISUAL EFFECTS";
-                font-size: 24px;
+                font-size: Style.font-heading;
                 color: Theme.c-text-hi;
             }
             Text {
                 x: 0px;
                 y: 38px;
                 text: "MODE";
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
             }
             Rectangle {
                 x: 0px;
                 y: 56px;
-                width: (parent.width - 16px) / 3;
-                height: 22px;
+                width: (parent.width - Style.space-sm * 2) / 3;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: root.visual-style == 0 ? "[ DEFAULT ON ]" : "[ DEFAULT OFF ]";
@@ -1246,10 +1045,10 @@ export component Main inherits Window {
                 }
             }
             Rectangle {
-                x: (parent.width - 16px) / 3 + 8px;
+                x: (parent.width - Style.space-sm * 2) / 3 + 8px;
                 y: 56px;
-                width: (parent.width - 16px) / 3;
-                height: 22px;
+                width: (parent.width - Style.space-sm * 2) / 3;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: root.visual-style == 1 ? "[ DOT MATRIX ON ]" : "[ DOT MATRIX OFF ]";
@@ -1257,28 +1056,34 @@ export component Main inherits Window {
                 }
             }
             Rectangle {
-                x: ((parent.width - 16px) / 3) * 2 + 16px;
+                x: ((parent.width - Style.space-sm * 2) / 3) * 2 + 16px;
                 y: 56px;
-                width: (parent.width - 16px) / 3;
-                height: 22px;
-                TuiBtn {
+                width: (parent.width - Style.space-sm * 2) / 3;
+                height: Style.control-h;
+                // PIANO has no Slint renderer yet; do not offer an active
+                // state that just duplicates the previously selected mode.
+                Text {
                     width: parent.width;
-                    label: root.visual-style == 2 ? "[ PIANO (DEV) ON ]" : "[ PIANO (DEV) OFF ]";
-                    clicked => root.set-style(2);
+                    height: parent.height;
+                    text: "[ PIANO (DEV) ]";
+                    font-size: Style.font-caption;
+                    color: Theme.c-text-dim;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
                 }
             }
             Text {
                 x: 0px;
                 y: 92px;
                 text: "LAYERS";
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
             }
             Rectangle {
                 x: 0;
                 y: 110px;
                 width: (parent.width - 8px) / 2;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: root.show-bg-spectrum ? "[ BG SPECTRUM ON ]" : "[ BG SPECTRUM OFF ]";
@@ -1289,7 +1094,7 @@ export component Main inherits Window {
                 x: (parent.width - 8px) / 2 + 8px;
                 y: 110px;
                 width: (parent.width - 8px) / 2;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: root.show-radial ? "[ RADIAL ON ]" : "[ RADIAL OFF ]";
@@ -1300,7 +1105,7 @@ export component Main inherits Window {
                 x: 0;
                 y: 136px;
                 width: (parent.width - 8px) / 2;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: root.show-core-pulse ? "[ CORE PULSE ON ]" : "[ CORE PULSE OFF ]";
@@ -1311,7 +1116,7 @@ export component Main inherits Window {
                 x: (parent.width - 8px) / 2 + 8px;
                 y: 136px;
                 width: (parent.width - 8px) / 2;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: root.show-lyrics ? "[ LYRICS ON ]" : "[ LYRICS OFF ]";
@@ -1322,7 +1127,7 @@ export component Main inherits Window {
                 x: 0;
                 y: 162px;
                 width: (parent.width - 8px) / 2;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: root.peak-hold ? "[ PEAK HOLD ON ]" : "[ PEAK HOLD OFF ]";
@@ -1333,23 +1138,23 @@ export component Main inherits Window {
                 x: 0px;
                 y: 198px;
                 text: "PARAMETERS";
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
             }
             Text {
                 x: 0px;
                 y: 216px;
                 text: "RADIAL SIZE";
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
-                height: 22px;
+                height: Style.control-h;
                 vertical-alignment: center;
             }
             Rectangle {
                 x: 100px;
                 y: 216px;
                 width: 34px;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: "[-]";
@@ -1361,16 +1166,16 @@ export component Main inherits Window {
                 y: 216px;
                 width: 48px;
                 text: Math.round(root.radial-scale * 100.0) + "%";
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text;
-                height: 22px;
+                height: Style.control-h;
                 vertical-alignment: center;
             }
             Rectangle {
                 x: 198px;
                 y: 216px;
                 width: 34px;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: "[+]";
@@ -1379,38 +1184,38 @@ export component Main inherits Window {
             }
         }
         if (root.settings-page == 2): Rectangle {
-            x: 20px;
-            y: 48px;
-            width: parent.width - 40px;
-            height: parent.height - 68px;
+            x: Style.panel-inset;
+            y: Style.panel-body-y;
+            width: parent.width - Style.panel-inset * 2;
+            height: parent.height - Style.panel-body-y - Style.panel-inset;
             clip: true;
             Text {
                 x: 0px;
                 y: 0px;
                 width: parent.width;
                 text: "THEME";
-                font-size: 24px;
+                font-size: Style.font-heading;
                 color: Theme.c-text-hi;
             }
             Text {
                 x: 0px;
                 y: 34px;
                 text: root.theme-current-line;
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
             }
             if (root.theme-auto-status != ""): Text {
                 x: 0px;
                 y: 52px;
                 text: root.theme-auto-status;
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
             }
             Rectangle {
                 x: 0;
                 y: root.theme-auto-status == "" ? 66px : 76px;
                 width: 96px;
-                height: 22px;
+                height: Style.theme-group-label-h;
                 TuiBtn {
                     width: parent.width;
                     label: "[ RELOAD ]";
@@ -1421,7 +1226,7 @@ export component Main inherits Window {
                 x: 104px;
                 y: root.theme-auto-status == "" ? 66px : 76px;
                 width: 120px;
-                height: 22px;
+                height: Style.theme-group-label-h;
                 TuiBtn {
                     width: parent.width;
                     label: root.theme-customize-label;
@@ -1433,7 +1238,7 @@ export component Main inherits Window {
                 y: root.theme-auto-status == "" ? 96px : 106px;
                 width: parent.width;
                 text: root.theme-load-error;
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-danger;
                 overflow: elide;
             }
@@ -1442,61 +1247,76 @@ export component Main inherits Window {
                 y: root.theme-auto-status == "" ? 114px : 124px;
                 width: parent.width;
                 text: root.theme-warnings;
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-danger;
                 overflow: elide;
             }
-            Text {
+            // AUTO chips and theme groups scroll together in one Flickable;
+            // the header above and the FILE footer below stay put.
+            Flickable {
                 x: 0px;
                 y: 140px;
-                text: "AUTO";
-                font-size: 12px;
-                color: Theme.c-text-dim;
-            }
-            Rectangle {
-                x: 0;
-                y: 158px;
-                width: (parent.width - 8px) / 2;
-                height: 28px;
-                for chip in root.auto-chips: ChipBtn {
-                    width: (parent.width - 8px) / 2;
-                    label: chip.name;
-                    grad-a: chip.grad-a;
-                    grad-b: chip.grad-b;
-                    fg: chip.fg;
-                    dim: chip.dim;
-                    active: chip.active;
-                    clicked => root.select-auto-theme(chip.dark);
-                }
-            }
-            for group in root.theme-groups: Rectangle {
-                x: 0px;
-                y: 196px + group.offset * 34px;
                 width: parent.width;
-                height: 30px + Math.ceil(group.chips.length / 4) * 34px;
-                Text {
-                    text: group.label;
-                    font-size: 12px;
-                    color: Theme.c-text-dim;
-                }
-                for chip in group.chips: ChipBtn {
-                    x: chip.col * ((parent.width - 24px) / 4 + 8px);
-                    y: 22px + chip.row * 34px;
-                    width: (parent.width - 24px) / 4;
-                    label: chip.name;
-                    grad-a: chip.grad-a;
-                    grad-b: chip.grad-b;
-                    fg: chip.fg;
-                    dim: chip.dim;
-                    active: chip.active;
-                    clicked => root.select-theme(chip.index);
+                height: parent.height - 140px - 26px;
+                // Explicit content size: the builtin default would derive
+                // content-width from the child layout and tie itself in knots.
+                content-width: parent.width;
+                content-height: root.theme-content-h * 1px;
+                VerticalLayout {
+                    spacing: Style.theme-gap;
+                    Text {
+                        height: Style.theme-auto-label-h;
+                        text: "AUTO";
+                        font-size: Style.font-caption;
+                        color: Theme.c-text-dim;
+                    }
+                    Rectangle {
+                        height: Style.chip-h;
+                        HorizontalLayout {
+                            spacing: Style.theme-gap;
+                            for chip in root.auto-chips: ChipBtn {
+                                width: (parent.width - Style.theme-gap) / 2;
+                                label: chip.name;
+                                grad-a: chip.grad-a;
+                                grad-b: chip.grad-b;
+                                fg: chip.fg;
+                                dim: chip.dim;
+                                active: chip.active;
+                                clicked => root.select-auto-theme(chip.dark);
+                            }
+                        }
+                    }
+                    for group in root.theme-groups: Rectangle {
+                        height: Style.theme-group-label-h + group.rows * Style.theme-row-step;
+                        Text {
+                            x: 0px;
+                            y: 0px;
+                            height: Style.theme-group-label-h;
+                            vertical-alignment: center;
+                            text: group.label;
+                            font-size: Style.font-caption;
+                            color: Theme.c-text-dim;
+                        }
+                        for chip in group.chips: ChipBtn {
+                            x: chip.col * ((parent.width - Style.theme-gap * (Style.theme-columns - 1)) / Style.theme-columns + Style.theme-gap);
+                            y: Style.theme-group-label-h + chip.row * Style.theme-row-step;
+                            width: (parent.width - Style.theme-gap * (Style.theme-columns - 1)) / Style.theme-columns;
+                            label: chip.name;
+                            grad-a: chip.grad-a;
+                            grad-b: chip.grad-b;
+                            fg: chip.fg;
+                            dim: chip.dim;
+                            active: chip.active;
+                            clicked => root.select-theme(chip.index);
+                        }
+                    }
                 }
             }
             Text {
                 x: 0px;
                 y: parent.height - 20px;
                 text: "FILE  " + root.theme-file-path;
-                font-size: 10px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
                 overflow: elide;
             }
@@ -1504,31 +1324,39 @@ export component Main inherits Window {
     }
 
     // ============ EQ overlay ============
+    // Modal: click anywhere outside the panel closes it.
+    if (root.show-eq): TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.toggle-eq(); }
+    }
     if (root.show-eq): Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        width: 700px;
-        height: 420px;
+        width: Style.eq-w;
+        height: Style.eq-h;
         background: Theme.c-bg;
-        border-width: 1px;
+        border-width: Style.stroke;
         border-color: Theme.c-text-hi;
+        // Swallow clicks inside the panel so they do not fall through.
+        TouchArea { }
         Text {
-            x: 20px;
-            y: 14px;
+            x: Style.panel-inset;
+            y: Style.panel-heading-y;
             text: "GRAPHIC EQUALIZER";
-            font-size: 22px;
+            font-size: Style.font-heading;
             color: Theme.c-text-hi;
         }
         CloseX {
-            x: parent.width - 54px;
-            y: 14px;
-            clicked => { root.show-eq = false; }
+            x: parent.width - Style.panel-inset - Style.close-w;
+            y: Style.panel-heading-y;
+            clicked => { root.toggle-eq(); }
         }
         Rectangle {
-            x: 20px;
-            y: 48px;
+            x: Style.panel-inset;
+            y: Style.panel-body-y;
             width: 42px;
-            height: 22px;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: "[ < ]";
@@ -1537,19 +1365,19 @@ export component Main inherits Window {
         }
         Text {
             x: 70px;
-            y: 48px;
+            y: Style.panel-body-y;
             width: 130px;
-            height: 22px;
+            height: Style.control-h;
             vertical-alignment: center;
             text: "PRESET: " + root.eq-preset-name;
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-text-hi;
         }
         Rectangle {
             x: 208px;
-            y: 48px;
+            y: Style.panel-body-y;
             width: 42px;
-            height: 22px;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: "[ > ]";
@@ -1558,9 +1386,9 @@ export component Main inherits Window {
         }
         Rectangle {
             x: 258px;
-            y: 48px;
+            y: Style.panel-body-y;
             width: 120px;
-            height: 22px;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: root.eq-enabled ? "[ ENABLED ON ]" : "[ ENABLED OFF ]";
@@ -1569,9 +1397,9 @@ export component Main inherits Window {
         }
         Rectangle {
             x: 386px;
-            y: 48px;
+            y: Style.panel-body-y;
             width: 84px;
-            height: 22px;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: "[ RESET ]";
@@ -1579,41 +1407,41 @@ export component Main inherits Window {
             }
         }
         Rectangle {
-            x: 20px;
-            y: 82px;
-            width: parent.width - 40px;
-            height: 280px;
+            x: Style.panel-inset;
+            y: Style.eq-plot-y;
+            width: parent.width - Style.panel-inset * 2;
+            height: Style.eq-plot-h;
             Rectangle {
-                y: (parent.height - 46px) / 2;
+                y: (parent.height - Style.eq-band-insets) / 2;
                 width: parent.width;
-                height: 1px;
+                height: Style.stroke;
                 background: Theme.c-line.with-alpha(0.59);
             }
             Rectangle {
-                x: 4px;
-                y: 22px;
-                width: 1px;
-                height: parent.height - 46px;
+                x: Style.space-xs;
+                y: Style.eq-band-inset-top;
+                width: Style.stroke;
+                height: parent.height - Style.eq-band-insets;
                 background: Theme.c-line;
             }
             Rectangle {
                 x: parent.width - 5px;
-                y: 22px;
-                width: 1px;
-                height: parent.height - 46px;
+                y: Style.eq-band-inset-top;
+                width: Style.stroke;
+                height: parent.height - Style.eq-band-insets;
                 background: Theme.c-line;
             }
             for band[bi] in root.eq-bands: Rectangle {
                 x: 4px + bi * ((parent.width - 8px) / 10);
                 width: (parent.width - 8px) / 10;
-                y: 22px;
-                height: parent.height - 46px;
-                property <length> seg-h: (parent.height - 46px) / 24;
+                y: Style.eq-band-inset-top;
+                height: parent.height - Style.eq-band-insets;
+                property <length> seg-h: (parent.height - Style.eq-band-insets) / 24;
                 Text {
                     y: 2px;
                     width: parent.width;
                     text: band.label;
-                    font-size: 10px;
+                    font-size: Style.font-caption;
                     color: root.eq-enabled ? Theme.c-text : Theme.c-text-dim;
                     horizontal-alignment: center;
                 }
@@ -1621,7 +1449,7 @@ export component Main inherits Window {
                     y: parent.height - 18px;
                     width: parent.width;
                     text: band.freq;
-                    font-size: 10px;
+                    font-size: Style.font-caption;
                     color: Theme.c-text-dim;
                     horizontal-alignment: center;
                 }
@@ -1630,7 +1458,7 @@ export component Main inherits Window {
                     property <bool> lit: band.gain > 0.0 ? band.gain >= self.level - 0.25
                         : (band.gain < 0.0 ? band.gain <= self.level + 0.5 : false);
                     x: (parent.width - parent.width * 0.34) / 2;
-                    y: 22px + si * parent.seg-h + 1px;
+                    y: Style.eq-band-inset-top + si * parent.seg-h + 1px;
                     height: parent.seg-h - 2px;
                     width: parent.width * 0.34;
                     background: self.lit ? (si < 12 ? Theme.c-text : Theme.c-text-hi)
@@ -1639,55 +1467,65 @@ export component Main inherits Window {
                 TouchArea {
                     mouse-cursor: ns-resize;
                     moved => {
+                        // Map over the lit segment strip (22 px top inset, 46 px
+                        // total insets) so the grabbed band matches the slider.
                         root.set-band(bi, Math.max(-12.0, Math.min(12.0,
-                            Math.round((0.5 - self.mouse-y / self.height) * 48.0) / 2.0)));
+                            Math.round((0.5 - (self.mouse-y - Style.eq-band-inset-top) / (self.height - Style.eq-band-insets)) * 48.0) / 2.0)));
                     }
                 }
             }
         }
         Text {
-            x: 20px;
+            x: Style.panel-inset;
             y: parent.height - 36px;
             text: root.eq-hint;
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim;
         }
     }
 
     // ============ BILIBILI overlay ============
+    // Modal: click anywhere outside the panel closes it.
+    if (root.show-download): TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => { root.open-download(); }
+    }
     if (root.show-download): Rectangle {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        width: 560px;
-        height: 420px;
+        width: Style.download-w;
+        height: Style.download-h;
         background: Theme.c-bg;
-        border-width: 1px;
+        border-width: Style.stroke;
         border-color: Theme.c-text-hi;
+        // Swallow clicks inside the panel so they do not fall through.
+        TouchArea { }
         CloseX {
-            x: parent.width - 54px;
-            y: 14px;
-            clicked => { root.show-download = false; }
+            x: parent.width - Style.panel-inset - Style.close-w;
+            y: Style.panel-heading-y;
+            clicked => { root.open-download(); }
         }
         Text {
-            x: 20px;
+            x: Style.panel-inset;
             y: 44px;
             text: "Download & Decode";
-            font-size: 24px;
+            font-size: Style.font-heading;
             color: Theme.c-text-hi;
         }
         Rectangle {
-            x: 20px;
+            x: Style.panel-inset;
             y: 84px;
-            width: parent.width - 40px;
+            width: parent.width - Style.panel-inset * 2;
             height: 28px;
             background: Theme.c-text-hi.with-alpha(0.92);
             TextInput {
-                x: 8px;
-                width: parent.width - 16px;
+                x: Style.space-sm;
+                width: parent.width - Style.space-sm * 2;
                 height: parent.height;
                 single-line: true;
-                font-family: "Fusion Pixel 12px Mono latin";
-                font-size: 13px;
+                font-family: Style.family-pixel;
+                font-size: Style.font-pixel-caption;
                 color: Theme.c-bg-deep;
                 vertical-alignment: center;
                 text <=> root.download-url;
@@ -1696,29 +1534,29 @@ export component Main inherits Window {
             }
             Text {
                 visible: root.download-url == "";
-                x: 8px;
+                x: Style.space-sm;
                 height: parent.height;
                 vertical-alignment: center;
                 text: "https://www.bilibili.com/video/BV...";
-                font-family: "Fusion Pixel 12px Mono latin";
-                font-size: 13px;
+                font-family: Style.family-pixel;
+                font-size: Style.font-pixel-caption;
                 color: Theme.c-bg-deep.with-alpha(0.45);
             }
         }
         Text {
-            x: 20px;
+            x: Style.panel-inset;
             y: 122px;
             text: "PROXY";
-            font-size: 10px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim;
         }
         TextInput {
-            x: 20px;
+            x: Style.panel-inset;
             y: 136px;
             width: parent.width - (root.env-proxy-visible ? 92px : 40px);
-            height: 20px;
+            height: Style.field-h;
             single-line: true;
-            font-size: 11px;
+            font-size: Style.font-caption;
             color: Theme.c-text;
             vertical-alignment: center;
             text <=> root.proxy-text;
@@ -1726,12 +1564,12 @@ export component Main inherits Window {
         }
         Text {
             visible: root.proxy-text == "";
-            x: 20px;
+            x: Style.panel-inset;
             y: 136px;
-            height: 20px;
+            height: Style.field-h;
             vertical-alignment: center;
             text: "DIRECT / 127.0.0.1:7890";
-            font-size: 11px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim.with-alpha(0.55);
         }
         TuiBtn {
@@ -1743,10 +1581,10 @@ export component Main inherits Window {
             clicked => root.use-env-proxy();
         }
         Rectangle {
-            x: 20px;
+            x: Style.panel-inset;
             y: 168px;
             width: root.download-running ? 110px : 120px;
-            height: 22px;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: root.download-running ? "[ CANCEL ]" : "[ DOWNLOAD ]";
@@ -1757,7 +1595,7 @@ export component Main inherits Window {
             x: 150px;
             y: 168px;
             width: 112px;
-            height: 22px;
+            height: Style.control-h;
             TuiBtn {
                 width: parent.width;
                 label: "[ OPEN DIR ]";
@@ -1765,35 +1603,35 @@ export component Main inherits Window {
             }
         }
         if (root.download-progress-text != ""): Text {
-            x: 20px;
+            x: Style.panel-inset;
             y: 202px;
             text: root.download-progress-text;
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-text-hi;
         }
         if (root.download-status != ""): Text {
-            x: 20px;
+            x: Style.panel-inset;
             y: 226px;
-            width: parent.width - 40px;
+            width: parent.width - Style.panel-inset * 2;
             text: root.download-status;
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-text;
             overflow: elide;
         }
         Text {
-            x: 20px;
+            x: Style.panel-inset;
             y: parent.height - 58px;
-            width: parent.width - 40px;
+            width: parent.width - Style.panel-inset * 2;
             text: "OUT  " + root.download-out-dir;
-            font-size: 10px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim;
             overflow: elide;
         }
         Text {
-            x: 20px;
+            x: Style.panel-inset;
             y: parent.height - 40px;
             text: "AAC / M4A  |  FFMPEG OPTIONAL";
-            font-size: 10px;
+            font-size: Style.font-caption;
             color: Theme.c-text-dim;
         }
     }
@@ -1801,51 +1639,54 @@ export component Main inherits Window {
     // ============ delete confirm ============
     if (root.confirm-visible): Rectangle {
         background: Theme.c-bg-deep.with-alpha(0.57);
+        // Block the app behind the modal; dismiss with ESC or CANCEL only.
+        TouchArea { }
         Rectangle {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
-            width: 460px;
-            height: 220px;
+            width: Style.dialog-w;
+            height: Style.dialog-h;
             background: Theme.c-bg;
-            border-width: 1px;
+            border-width: Style.stroke;
             border-color: Theme.c-danger;
             Text {
-                x: 20px;
-                y: 16px;
+                x: Style.panel-inset;
+                y: Style.space-lg;
                 text: "REMOVE TRACK FROM DISK?";
-                font-size: 22px;
+                font-size: Style.font-heading;
                 color: Theme.c-text-hi;
             }
             Text {
-                x: 20px;
+                x: Style.panel-inset;
                 y: 52px;
-                width: parent.width - 40px;
+                width: parent.width - Style.panel-inset * 2;
                 text: root.confirm-name;
-                font-size: 13px;
+                font-family: Style.family-pixel;
+                font-size: Style.font-pixel-caption;
                 color: Theme.c-text-hi;
                 overflow: elide;
             }
             Text {
-                x: 20px;
+                x: Style.panel-inset;
                 y: 74px;
-                width: parent.width - 40px;
+                width: parent.width - Style.panel-inset * 2;
                 text: root.confirm-path;
-                font-size: 10px;
+                font-size: Style.font-caption;
                 color: Theme.c-text-dim;
                 overflow: elide;
             }
             Text {
-                x: 20px;
+                x: Style.panel-inset;
                 y: 100px;
                 text: "THIS CANNOT BE UNDONE.";
-                font-size: 12px;
+                font-size: Style.font-caption;
                 color: Theme.c-danger;
             }
             Rectangle {
-                x: 20px;
+                x: Style.panel-inset;
                 y: parent.height - 40px;
                 width: 100px;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: "[ CANCEL ]";
@@ -1856,7 +1697,7 @@ export component Main inherits Window {
                 x: 130px;
                 y: parent.height - 40px;
                 width: 100px;
-                height: 22px;
+                height: Style.control-h;
                 TuiBtn {
                     width: parent.width;
                     label: "[ DELETE ]";
@@ -1869,30 +1710,31 @@ export component Main inherits Window {
     // ============ error toast ============
     if (root.error-visible): Rectangle {
         x: parent.width - self.width - 20px;
-        y: parent.height - 124px - 24px - self.height;
-        width: 480px;
-        height: 64px;
+        y: parent.height - Style.dock-h - Style.space-2xl - self.height;
+        width: Style.toast-w;
+        height: Style.toast-h;
         background: Theme.c-bg;
-        border-width: 1px;
+        border-width: Style.stroke;
         border-color: Theme.c-text-hi;
+        TouchArea { }
         Text {
-            x: 12px;
-            y: 8px;
+            x: Style.space-md;
+            y: Style.space-sm;
             text: "ERROR";
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-danger;
         }
         CloseX {
             x: parent.width - 46px;
-            y: 4px;
+            y: Style.space-xs;
             clicked => root.clear-error();
         }
         Text {
-            x: 12px;
+            x: Style.space-md;
             y: 30px;
-            width: parent.width - 24px;
+            width: parent.width - Style.space-md * 2;
             text: root.error-text;
-            font-size: 12px;
+            font-size: Style.font-caption;
             color: Theme.c-text-hi;
             overflow: elide;
         }

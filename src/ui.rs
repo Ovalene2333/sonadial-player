@@ -28,15 +28,13 @@ use crate::theme_library::{ThemeEntry, ThemeLibrary};
 
 slint::include_modules!();
 
+mod preview;
+
 const BEAT_VISUAL_LEAD: f64 = 0.025;
 const SAVE_EVERY: Duration = Duration::from_secs(2);
 const AUDIO_EXTS: [&str; 8] = ["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "alac"];
 const VOLUME_STEP: f32 = 0.05;
 const SEEK_STEP: f64 = 5.0;
-const TOP_H: f32 = 44.0;
-const DOCK_H: f32 = 124.0;
-const SIDEBAR_W: f32 = 360.0;
-const ROW_H: f32 = 26.0;
 
 #[derive(Clone)]
 pub struct TrackEntry {
@@ -152,7 +150,6 @@ pub struct Player {
     download_status: String,
     download_rx: Option<Receiver<DownloadEvent>>,
     download_cancel: Option<Arc<AtomicBool>>,
-    maximized: bool,
     error: Option<String>,
     pending_delete: Option<PathBuf>,
     ui_weak: slint::Weak<Main>,
@@ -183,7 +180,10 @@ pub struct Player {
 
 impl Player {
     fn new(initial: Option<PathBuf>) -> Self {
-        let state = storage::load();
+        let mut state = storage::load();
+        // The Slint stage currently implements DEFAULT and DOT MATRIX. Old
+        // PIANO selections used to leave the previous drawing style active.
+        state.piano_mode = false;
         let config = BeatConfig::load();
         let library = ThemeLibrary::load();
         let mut engine = AudioEngine::new();
@@ -240,7 +240,6 @@ impl Player {
             download_status: String::new(),
             download_rx: None,
             download_cancel: None,
-            maximized: false,
             error: None,
             pending_delete: None,
             ui_weak: Default::default(),
@@ -654,9 +653,9 @@ impl Player {
 
     fn open_context_menu(&mut self, ui: &Main) {
         CONTEXT_SLOT.with(|cell| {
-            let guard = cell.borrow();
-            if let Some((index, x, y)) = *guard {
-                drop(guard);
+            // Drain the slot: the menu stays open through context-index, and
+            // clicking outside (or another row) re-arms the slot as needed.
+            if let Some((index, x, y)) = cell.borrow_mut().take() {
                 let Some(track) = self.playlist.get(index) else {
                     ui.set_context_index(-1);
                     return;
@@ -841,30 +840,21 @@ impl Player {
     }
 
     fn set_style(&mut self, style: u8) {
-        match style {
-            0 => {
-                self.state.piano_mode = false;
-                self.state.led_bars = false;
-                self.state.braille_stream = false;
-            }
-            1 => {
-                self.state.piano_mode = false;
-                self.state.led_bars = true;
-                self.state.braille_stream = true;
-            }
-            _ => {
-                self.state.piano_mode = true;
-            }
-        }
+        let dots = match style {
+            0 => false,
+            1 => true,
+            _ => return,
+        };
+        self.state.piano_mode = false;
+        self.state.led_bars = dots;
+        self.state.braille_stream = dots;
         self.stage_dirty = true;
         self.dirty = true;
     }
 
     fn cycle_visual_mode(&mut self) {
-        if self.state.piano_mode {
+        if self.state.led_bars && self.state.braille_stream {
             self.set_style(0);
-        } else if self.state.led_bars && self.state.braille_stream {
-            self.set_style(2);
         } else {
             self.set_style(1);
         }
@@ -1158,22 +1148,19 @@ impl Player {
 
         // Geometry: sidebar + top bar + dock carve the stage out of the window.
         let window = ui.window();
+        ui.set_window_maximized(window.is_maximized());
         let scale = window.scale_factor() as f32;
         let size = window.size();
-        let logical_w = size.width as f32 / scale;
-        let logical_h = size.height as f32 / scale;
-        let sidebar_w = if self.sidebar_open { SIDEBAR_W } else { 0.0 };
-        let stage_rect = (
-            sidebar_w,
-            TOP_H,
-            (logical_w - sidebar_w).max(1.0),
-            (logical_h - TOP_H - DOCK_H).max(1.0),
-        );
         ui.set_sidebar_open(self.sidebar_open);
-        ui.set_stage_x(stage_rect.0);
-        ui.set_stage_y(stage_rect.1);
-        ui.set_stage_w(stage_rect.2);
-        ui.set_stage_h(stage_rect.3);
+        // Slint owns the layout. Read its resolved geometry so the CPU stage,
+        // resize handling and hit areas all follow ui/style.slint.
+        let stage_rect = (
+            ui.get_stage_x(),
+            ui.get_stage_y(),
+            ui.get_stage_w(),
+            ui.get_stage_h(),
+        );
+        let style = ui.global::<Style>();
 
         // The stage texture only needs a repaint while something actually
         // moves; standby with a silent analyzer is a fully static frame.
@@ -1215,11 +1202,6 @@ impl Player {
             );
             ui.set_stage(slint::Image::from_rgba8(output.buffer));
             ui.set_disc_r(output.disc_r);
-            if let Some(grid) = output.grid {
-                ui.set_grid_l(stage_rect.0 + grid.left);
-                ui.set_grid_r(stage_rect.0 + grid.right);
-                ui.set_grid_cx(stage_rect.0 + grid.center_x);
-            }
         }
 
         // Dock: title, metadata, ASCII seek + volume, transport labels.
@@ -1264,13 +1246,12 @@ impl Player {
         ui.set_mode_long(mode.label().to_owned().into());
         ui.set_mode_short(mode.short_label().to_owned().into());
 
-        // ASCII meter geometry: 13 px cell, track width capped at 55% of the
-        // window, minus the time readout, exactly like the egui dock.
-        let cell_w = 13.0_f32;
-        let title_max_w = (logical_w * 0.55).max(260.0);
+        // The meter and its Rust-generated strings share the style's advance.
+        let cell_w = style.get_dock_cell_w();
         let time_w = time_text.chars().count() as f32 * cell_w;
-        let cells = (((title_max_w - 10.0 - time_w) / cell_w).floor() as isize - 2)
-            .clamp(18, 140) as usize;
+        let cells = (((ui.get_dock_content_w() - style.get_dock_time_gap() - time_w)
+            / cell_w).floor() as i32 - 2)
+            .clamp(style.get_dock_seek_min_cells(), style.get_dock_seek_max_cells()) as usize;
         let shown = self.seek_preview.unwrap_or(progress);
         let filled = ((shown * cells as f32).round() as usize).min(cells);
         ui.set_seek_cells(cells as i32);
@@ -1280,8 +1261,8 @@ impl Player {
         ui.set_time_text(time_text.clone().into());
         ui.set_progress(progress);
 
-        let vol_norm = (self.engine.volume() / 1.25).clamp(0.0, 1.0);
-        let vol_cells = 16usize;
+        let vol_norm = (self.engine.volume() / style.get_volume_max()).clamp(0.0, 1.0);
+        let vol_cells = style.get_dock_volume_cells() as usize;
         let vol_filled = ((vol_norm * vol_cells as f32).round() as usize).min(vol_cells);
         ui.set_vol_filled(vol_filled as i32);
         ui.set_vol_fill_str("#".repeat(vol_filled).into());
@@ -1289,6 +1270,13 @@ impl Player {
         ui.set_vol_pct(format!("{:>3}%", (vol_norm * 100.0).round() as i32).into());
 
         ui.set_play_label(if active { "PAUSE" } else { "PLAY" }.into());
+        ui.set_core_status(if info.is_none() {
+            "[STANDBY]"
+        } else if paused {
+            "[PAUSED]"
+        } else {
+            "[PLAYING]"
+        }.into());
 
         // Overlays.
         ui.set_show_settings(self.show_settings);
@@ -1300,14 +1288,12 @@ impl Player {
         ui.set_show_radial(self.state.show_radial);
         ui.set_show_core_pulse(self.state.show_core_pulse);
         ui.set_radial_scale(self.state.radial_scale);
-        let style = if self.state.piano_mode {
-            2
-        } else if self.state.led_bars && self.state.braille_stream {
+        let visual_style = if self.state.led_bars && self.state.braille_stream {
             1
         } else {
             0
         };
-        ui.set_visual_style(style);
+        ui.set_visual_style(visual_style);
         ui.set_out_label(if info.is_some() {
             self.engine.output_label()
         } else {
@@ -1360,6 +1346,11 @@ impl Player {
         ui.set_download_out_dir(storage::download_dir().display().to_string().into());
 
         // Modal + toast.
+        ui.set_confirm_visible(self.pending_delete.is_some());
+        if let Some(path) = &self.pending_delete {
+            ui.set_confirm_name(track_title(path).into());
+            ui.set_confirm_path(path.display().to_string().into());
+        }
         ui.set_error_visible(self.error.is_some());
         if let Some(error) = &self.error {
             ui.set_error_text(elide_chars(error, 160).into());
@@ -1368,8 +1359,9 @@ impl Player {
         // Sidebar UI: rebuild the track model on change; auto-scroll to the
         // track that just started playing.
         ui.set_track_count(self.playlist.len() as i32);
-        let list_h = (logical_h - TOP_H - DOCK_H - 111.0).max(60.0);
-        let content_h = self.playlist.len() as f32 * ROW_H;
+        let list_h = ui.get_library_viewport_h();
+        let row_h = style.get_row_h();
+        let content_h = self.playlist.len() as f32 * row_h;
         let scroll_max = (content_h - list_h).max(0.0);
         ui.set_scroll_max(scroll_max);
         if let Some(index) = self.auto_scroll_target.take() {
@@ -1377,7 +1369,7 @@ impl Player {
                 .iter()
                 .position(|&filtered| filtered == index)
                 .unwrap_or(index) as f32;
-            self.scroll_y = ((row * ROW_H - list_h * 0.5).clamp(0.0, scroll_max)) as f32;
+            self.scroll_y = ((row * row_h - list_h * 0.5).clamp(0.0, scroll_max)) as f32;
         }
         self.scroll_y = self.scroll_y.clamp(0.0, scroll_max);
         ui.set_scroll_y(self.scroll_y);
@@ -1388,7 +1380,7 @@ impl Player {
             self.current
                 .and_then(|current| filtered.iter().position(|&index| index == current))
                 .map(|row| {
-                    let cells = ((list_h / 13.0).floor().max(1.0)) as i32;
+                    let cells = ((list_h / style.get_scroll_cell_h()).floor().max(1.0)) as i32;
                     (((row as f32 + 0.5) / filtered.len() as f32) * cells as f32)
                         .floor()
                         .min((cells - 1) as f32) as i32
@@ -1396,13 +1388,16 @@ impl Player {
                 .unwrap_or(-1)
         };
         ui.set_current_cell(current_cell);
+        ui.set_selected_index(self.selected_track.map_or(-1, |index| index as i32));
 
         if self.track_ui_dirty {
             self.track_ui_dirty = false;
             let mut model = slint::VecModel::<TrackRow>::default();
             for &index in &filtered {
                 let track = &self.playlist[index];
-                let selected = self.current == Some(index) || self.selected_track == Some(index);
+                // Only the current track is inverted. Mouse hover and the
+                // clicked row use outlines without rebuilding the model.
+                let selected = self.current == Some(index);
                 let playing = self.current == Some(index) && active;
                 model.push(TrackRow {
                     index: index as i32,
@@ -1512,7 +1507,11 @@ impl Player {
 
         let mut groups = slint::VecModel::<ChipGroup>::default();
         let entries = self.library.entries();
-        let mut offset = 0usize;
+        // Match the theme grid's row stride, columns and spacing in Style.
+        let style = ui.global::<Style>();
+        let columns = style.get_theme_columns() as usize;
+        let mut content_h = style.get_theme_auto_label_h()
+            + style.get_theme_gap() + style.get_chip_h();
         for category in Category::ALL {
             let members: Vec<usize> = (0..entries.len())
                 .filter(|&index| entries[index].category == category)
@@ -1524,10 +1523,10 @@ impl Player {
             let (dark, light): (Vec<usize>, Vec<usize>) = members
                 .iter()
                 .partition(|&&index| entries[index].look.palette.dark);
-            let rows: Vec<&[usize]> = if members.len() <= 4 {
+            let rows: Vec<&[usize]> = if members.len() <= columns {
                 vec![&members[..]]
             } else {
-                dark.chunks(4).chain(light.chunks(4)).collect()
+                dark.chunks(columns).chain(light.chunks(columns)).collect()
             };
             for (row, row_members) in rows.iter().enumerate() {
                 for (col, &index) in row_members.iter().enumerate() {
@@ -1549,12 +1548,14 @@ impl Player {
             }
             groups.push(ChipGroup {
                 label: category.label().into(),
-                offset: offset as i32,
+                rows: rows.len() as i32,
                 chips: slint::ModelRc::from(Rc::new(chips)),
             });
-            offset += 1 + rows.iter().map(|row| row.len().div_ceil(4)).sum::<usize>().max(1);
+            content_h += style.get_theme_gap() + style.get_theme_group_label_h()
+                + rows.len() as f32 * style.get_theme_row_step();
         }
         ui.set_theme_groups(slint::ModelRc::from(Rc::new(groups)));
+        ui.set_theme_content_h(content_h);
     }
 
     fn push_lyrics(&mut self, ui: &Main, position: f64) {
@@ -1719,6 +1720,11 @@ fn with_player<R>(body: impl FnOnce(&mut Player) -> R) -> Option<R> {
 }
 
 pub fn run(initial: Option<PathBuf>) {
+    // Opt-in offscreen render probe: no native window, audio or saved state.
+    if let Some(dir) = std::env::var_os("SONADIAL_RENDER_PREVIEW") {
+        preview::render(Path::new(&dir)).expect("render UI previews");
+        return;
+    }
     register_fonts();
 
     let ui = Main::new().expect("slint window");
@@ -1797,10 +1803,12 @@ pub fn run(initial: Option<PathBuf>) {
     });
     ui.on_toggle_maximize(|| {
         with_player(|player| {
-            player.maximized = !player.maximized;
-            let maximized = player.maximized;
             if let Some(ui) = player.ui_weak.upgrade() {
-                ui.window().set_maximized(maximized);
+                // Native title-bar gestures and OS window management can
+                // change this state without going through our button.
+                let window = ui.window();
+                window.set_maximized(!window.is_maximized());
+                player.stage_dirty = true;
             }
         });
     });
@@ -1829,7 +1837,9 @@ pub fn run(initial: Option<PathBuf>) {
     ui.on_select_track(|index| {
         with_player(|player| {
             player.selected_track = Some(index as usize);
-            player.track_ui_dirty = true;
+            // No model rebuild here: recreating the row items between the two
+            // clicks breaks Slint's double-click detection. The highlight is
+            // driven by the selected-index property instead.
         });
     });
     ui.on_queue_next(|index| {
@@ -2094,6 +2104,20 @@ pub fn run(initial: Option<PathBuf>) {
 
     let weak = ui.as_weak();
     player.ui_weak = weak.clone();
+
+    // Debug helper: SONADIAL_DEBUG_UI=sys|sys2|eq|bili opens an overlay at
+    // startup so the panels can be inspected (and screenshot) headlessly.
+    match std::env::var("SONADIAL_DEBUG_UI").as_deref() {
+        Ok("sys") => player.show_settings = true,
+        Ok("sys2") => {
+            player.show_settings = true;
+            ui.set_settings_page(2);
+        }
+        Ok("eq") => player.show_eq = true,
+        Ok("bili") => player.show_download = true,
+        _ => {}
+    }
+
     PLAYER.with(|cell| *cell.borrow_mut() = Some(player));
     let timer = slint::Timer::default();
     timer.start(
@@ -2123,28 +2147,29 @@ pub fn run(initial: Option<PathBuf>) {
 /// .slint font-family names resolve. Uses the unstable fontique hook, same as
 /// the wasm gallery demo does for its downloaded CJK font.
 fn register_fonts() {
-    const FONTS: &[&[u8]] = &[
-        include_bytes!("../assets/fonts/FusionPixel12-Mono-CJK.ttf"),
-        include_bytes!("../assets/fonts/FusionPixel12-Mono-JA.ttf"),
-        include_bytes!("../assets/fonts/FusionPixel12-Mono-KO.ttf"),
-        include_bytes!("../assets/fonts/FusionPixel12-Mono-TUI.ttf"),
-        include_bytes!("../assets/fonts/SarasaMonoSC-TUI.ttf"),
+    // Prepend in reverse priority for Han: SC, then Japanese, then Korean.
+    // Kana and Hangul each get their own face first.
+    const FONTS: &[(&[u8], &[&str])] = &[
+        (include_bytes!("../assets/fonts/FusionPixel12-Mono-KO.ttf"), &["Hang", "Hani"]),
+        (include_bytes!("../assets/fonts/FusionPixel12-Mono-JA.ttf"), &["Hira", "Kana", "Hani"]),
+        (include_bytes!("../assets/fonts/FusionPixel12-Mono-CJK.ttf"), &["Hani"]),
+        (include_bytes!("../assets/fonts/FusionPixel12-Mono-TUI.ttf"), &[]),
+        (include_bytes!("../assets/fonts/SarasaMonoSC-TUI.ttf"), &[]),
     ];
     use slint::fontique_011::fontique;
     let mut collection = slint::fontique_011::shared_collection();
-    for data in FONTS {
+    for (data, scripts) in FONTS {
         let blob = fontique::Blob::new(Arc::new((*data).to_vec()));
         for (family_id, _infos) in collection.register_fonts(blob, None) {
-            // CJK pixel faces must join the fallback chain for Han/Kana/Hangul
-            // so mixed-language lyrics render without a system font.
-            for script in ["Hani", "Kana", "Hang"] {
-                collection.append_fallbacks(
-                    fontique::FallbackKey::new(
-                        fontique::Script::from_str_unchecked(script),
-                        None,
-                    ),
-                    std::iter::once(family_id),
+            // Appending after system fallbacks lets Windows choose a smooth
+            // CJK font before the bundled pixel face is ever considered.
+            for script in *scripts {
+                let key = fontique::FallbackKey::new(
+                    fontique::Script::from_str_unchecked(script),
+                    None,
                 );
+                let existing: Vec<_> = collection.fallback_families(key).collect();
+                collection.set_fallbacks(key, std::iter::once(family_id).chain(existing));
             }
         }
     }

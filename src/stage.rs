@@ -80,6 +80,17 @@ fn paint_spectrum(
     let bar_w = (2.8 * scale).max(1.0);
     let stroke_w = (1.5 * scale).max(1.0);
 
+    // Pixel modes have only discrete cells, including the peak markers.
+    // Keep the continuous baseline and glow exclusive to the smooth mode.
+    if led_bars {
+        if dot_bars {
+            paint_radial_dots(canvas, rect, ppp, center, inner_r, max_amp, bars, peaks, show_peaks, rotation);
+        } else {
+            paint_radial_led(canvas, center, ppp, inner_r, max_amp, bars, peaks, show_peaks, rotation, scale);
+        }
+        return;
+    }
+
     // A quiet baseline; no instrument bezel, ticks or labels.
     canvas.circle_stroke(
         center.0 * ppp,
@@ -103,15 +114,6 @@ fn paint_spectrum(
     if !bars.iter().any(|bar| *bar > 0.01)
         && !(show_peaks && peaks.iter().any(|peak| *peak > 0.01))
     {
-        return;
-    }
-
-    if led_bars {
-        if dot_bars {
-            paint_radial_dots(canvas, rect, ppp, center, inner_r, max_amp, bars, peaks, show_peaks, rotation);
-        } else {
-            paint_radial_led(canvas, center, ppp, inner_r, max_amp, bars, peaks, show_peaks, rotation, scale);
-        }
         return;
     }
 
@@ -430,8 +432,7 @@ fn conical_color(t: f32, ring: Rgba, hi: Rgba, deep: Rgba, main_a: u8) -> Rgba {
 }
 
 // TUI-style radial LED matrix: discrete cells along each spoke, four grey
-// levels, no glow. Ported from viz.rs paint_radial_led (quads drawn as
-// capsules: the shape is the same rotated rectangle with rounded caps).
+// levels, no glow. Flat-ended rectangles preserve the egui quad geometry.
 #[allow(clippy::too_many_arguments)]
 fn paint_radial_led(
     canvas: &mut Canvas,
@@ -466,17 +467,13 @@ fn paint_radial_led(
         let angle =
             std::f32::consts::FRAC_PI_2 + i as f32 / NUM_BARS as f32 * TAU + rotation;
         let dir = (angle.cos(), angle.sin());
-        let radial = |r: f32, t: f32| {
-            (center.0 + dir.0 * r + -dir.1 * t, center.1 + dir.1 * r + dir.0 * t)
-        };
+        let radial = |r: f32| ((center.0 + dir.0 * r) * ppp, (center.1 + dir.1 * r) * ppp);
         for cell in 0..lit {
             let r0 = inner_r + cell as f32 * cell_step;
             let r1 = (r0 + cell_len).min(inner_r + max_amp);
             let t = ((cell + 1) as f32 / steps as f32).clamp(0.0, 1.0);
             let level = (t * 3.0).round() / 3.0;
-            let p0 = radial(r0, 0.0);
-            let p1 = radial(r1, 0.0);
-            canvas.line(p0.0 * ppp, p0.1 * ppp, p1.0 * ppp, p1.1 * ppp, cell_w * ppp, spectrum_color(level));
+            canvas.radial_cell(radial((r0 + r1) * 0.5), dir, (r1 - r0) * ppp, cell_w * ppp, spectrum_color(level));
         }
         if show_peaks && peak_value > bar_value + PEAK_MARKER_GAP_DB {
             let half = cell_len * 0.5;
@@ -486,9 +483,7 @@ fn paint_radial_led(
             let peak_r = (inner_r + peak_norm * max_amp).clamp(low, high);
             let r0 = peak_r - half;
             let r1 = (peak_r + half).min(outer);
-            let p0 = radial(r0, 0.0);
-            let p1 = radial(r1, 0.0);
-            canvas.line(p0.0 * ppp, p0.1 * ppp, p1.0 * ppp, p1.1 * ppp, cell_w * ppp, spectrum_color(1.0));
+            canvas.radial_cell(radial((r0 + r1) * 0.5), dir, (r1 - r0) * ppp, cell_w * ppp, spectrum_color(1.0));
         }
     }
 }
@@ -520,6 +515,7 @@ fn paint_radial_dots(
         let angle =
             std::f32::consts::FRAC_PI_2 + i as f32 / NUM_BARS as f32 * TAU + rotation;
         let dir = (angle.cos(), angle.sin());
+        let radial = |r: f32| ((center.0 + dir.0 * r) * ppp, (center.1 + dir.1 * r) * ppp);
         let lit = if norm <= 0.01 {
             0
         } else {
@@ -530,9 +526,7 @@ fn paint_radial_dots(
             let r1 = (r0 + dot).min(inner_r + max_amp);
             let t = ((cell + 1) as f32 / steps as f32).clamp(0.0, 1.0);
             let level = (t * 3.0).round() / 3.0;
-            let p0 = (center.0 + dir.0 * r0, center.1 + dir.1 * r0);
-            let p1 = (center.0 + dir.0 * r1, center.1 + dir.1 * r1);
-            canvas.line(p0.0 * ppp, p0.1 * ppp, p1.0 * ppp, p1.1 * ppp, dot * ppp, spectrum_color(level));
+            canvas.radial_cell(radial((r0 + r1) * 0.5), dir, (r1 - r0) * ppp, dot * ppp, spectrum_color(level));
         }
         if show_peaks && peak_value > bar_value + PEAK_MARKER_GAP_DB {
             let half = dot * 0.5;
@@ -542,9 +536,7 @@ fn paint_radial_dots(
             let peak_r = (inner_r + peak_norm * max_amp).clamp(low, high);
             let r0 = peak_r - half;
             let r1 = (peak_r + half).min(outer);
-            let p0 = (center.0 + dir.0 * r0, center.1 + dir.1 * r0);
-            let p1 = (center.0 + dir.0 * r1, center.1 + dir.1 * r1);
-            canvas.line(p0.0 * ppp, p0.1 * ppp, p1.0 * ppp, p1.1 * ppp, dot * ppp, spectrum_color(1.0));
+            canvas.radial_cell(radial((r0 + r1) * 0.5), dir, (r1 - r0) * ppp, dot * ppp, spectrum_color(1.0));
         }
     }
 }
@@ -579,10 +571,9 @@ fn paint_dot_stream(
             let t = (row as f32 + 1.0) / rows as f32;
             let grey = (92.0 + 148.0 * t).round() as u8;
             let alpha_v = (42.0 + 104.0 * t).round() as u8;
-            canvas.rect(
-                (x - dot * 0.5) * ppp,
-                (y - dot * 0.5) * ppp,
-                dot * ppp,
+            canvas.pixel_square(
+                x * ppp,
+                y * ppp,
                 dot * ppp,
                 ink_alpha(grey, alpha_v),
             );
@@ -641,10 +632,9 @@ fn paint_core_dots(
             } else {
                 ink_alpha(255, ring_alpha)
             };
-            canvas.rect(
-                (x - dot * 0.5) * ppp,
-                (y - dot * 0.5) * ppp,
-                dot * ppp,
+            canvas.pixel_square(
+                x * ppp,
+                y * ppp,
                 dot * ppp,
                 color,
             );
@@ -670,13 +660,6 @@ fn dot_metrics_for_rect(rect: (f32, f32, f32, f32), ppp: f32) -> (f32, f32) {
 
 // ---------- background LED wall (viz.rs paint_bar_spectrum) ----------
 
-pub struct GridInfo {
-    /// Label anchors in logical pixels.
-    pub left: f32,
-    pub right: f32,
-    pub center_x: f32,
-}
-
 struct Grid {
     left: f32,
     top: f32,
@@ -699,12 +682,11 @@ fn cell_dev(ppp: f32) -> usize {
 fn pixel_grid(rect: (f32, f32, f32, f32), ppp: f32) -> Option<Grid> {
     let (rx, ry, rw, rh) = rect;
     let ppp = ppp.max(1.0);
-    let side_margin = 12.0;
-    let top_margin = 24.0;
-    let bottom_margin = 24.0;
-    let max_w = (rw - side_margin * 2.0).max(0.0);
-    let max_h = (rh - top_margin - bottom_margin).max(0.0);
     let cell_px = cell_dev(ppp);
+    // The lattice sits one grid cell away from each edge of the stage box.
+    let margin = cell_px as f32 / ppp;
+    let max_w = (rw - margin * 2.0).max(0.0);
+    let max_h = (rh - margin * 2.0).max(0.0);
     let cols = ((max_w * ppp) as usize) / cell_px;
     let rows = ((max_h * ppp) as usize) / cell_px;
     if cols < 8 || rows < 4 {
@@ -713,8 +695,13 @@ fn pixel_grid(rect: (f32, f32, f32, f32), ppp: f32) -> Option<Grid> {
     let cell = cell_px as f32 / ppp;
     let panel_w = cols as f32 * cell;
     let panel_h = rows as f32 * cell;
-    let mut left_dev = ((rx + side_margin + (max_w - panel_w) * 0.5) * ppp).round() as i32;
-    let mut bottom_dev = ((ry + rh - bottom_margin) * ppp).round() as i32;
+    let panel_h_dev = (rows * cell_px) as i32;
+    let mut left_dev = ((rx + margin + (max_w - panel_w) * 0.5) * ppp).round() as i32;
+    // Centre the panel vertically between the margins; the leftover fraction
+    // of one cell splits evenly between top and bottom.
+    let box_top_dev = ((ry + margin) * ppp).round() as i32;
+    let box_bottom_dev = ((ry + rh - margin) * ppp).round() as i32;
+    let mut bottom_dev = box_bottom_dev - ((box_bottom_dev - box_top_dev - panel_h_dev) / 2);
     // Shift the lattice so the stage centre becomes a symmetry point.
     let symmetry = (cell_px / 4).max(1) as i32;
     let center_x = ((rx + rw * 0.5) * ppp).round() as i32;
@@ -789,6 +776,19 @@ fn painted_grid(canvas: &mut Canvas, grid: &Grid, ppp: f32, light: bool) {
     }
 }
 
+/// Use the same lattice as the lit dots, without a second 12px grid that
+/// visually splits the matrix into groups of four.
+fn painted_dot_grid(canvas: &mut Canvas, grid: &Grid, ppp: f32) {
+    let (step, dot) = dot_metrics_from_grid(grid, ppp);
+    for col in 0..grid.cols * DOTS_PER_CELL {
+        let x = grid.left + (col as f32 + 0.5) * step;
+        for row in 0..grid.rows * DOTS_PER_CELL {
+            let y = grid.bottom - (row as f32 + 0.5) * step;
+            canvas.pixel_square(x * ppp, y * ppp, dot * ppp, ink_alpha(210, 8));
+        }
+    }
+}
+
 fn mapped_bar(bars: &[f32], cols: usize, col: usize) -> f32 {
     // V-shaped layout: low frequencies at both edges, high in the centre.
     // The two halves take alternate bands so the right side is not a clone.
@@ -835,19 +835,22 @@ fn paint_led_cells(canvas: &mut Canvas, grid: &Grid, ppp: f32, bars: &[f32]) {
     }
 }
 
-fn grid_info(grid: &Grid) -> GridInfo {
-    GridInfo {
-        left: grid.left,
-        right: grid.left + grid.cols as f32 * grid.cell,
-        center_x: grid.left + grid.cols as f32 * grid.cell * 0.5,
-    }
-}
-
 // ---------- public entry ----------
+
+#[derive(PartialEq)]
+struct BackgroundKey {
+    size: (u32, u32),
+    scale: u32,
+    corners: [Rgb; 4],
+    dark: bool,
+    rect: [u32; 4],
+    dot_grid: bool,
+    show_grid: bool,
+}
 
 pub struct Stage {
     bg: Vec<u8>,
-    bg_key: Option<(u32, u32, u32, [Rgb; 4], bool)>,
+    bg_key: Option<BackgroundKey>,
     grid: Option<Grid>,
     /// Double buffer: alternate between two textures so the frame handed to
     /// the renderer is never the one being repainted next tick.
@@ -875,7 +878,6 @@ pub struct StageInput<'a> {
 
 pub struct StageOutput {
     pub buffer: slint::SharedPixelBuffer<slint::Rgba8Pixel>,
-    pub grid: Option<GridInfo>,
     pub disc_r: f32,
 }
 
@@ -900,15 +902,37 @@ impl Stage {
         input: StageInput,
     ) -> StageOutput {
         let corners = look.gradient.unwrap_or([look.palette.bg; 4]);
-        let key = (width, height, ppp.to_bits(), corners, look.palette.dark);
-        if self.bg_key != Some(key) {
+        // The grid is baked into the cached background, so the cache key must
+        // cover the stage rect too: collapsing the sidebar moves the lattice
+        // even though the window size and theme stay the same.
+        let key = BackgroundKey {
+            size: (width, height),
+            scale: ppp.to_bits(),
+            corners,
+            dark: look.palette.dark,
+            rect: [
+                stage_rect.0.to_bits(),
+                stage_rect.1.to_bits(),
+                stage_rect.2.to_bits(),
+                stage_rect.3.to_bits(),
+            ],
+            dot_grid: input.braille_stream,
+            show_grid: input.show_bg_spectrum,
+        };
+        if self.bg_key.as_ref() != Some(&key) {
             let mut bg = vec![0_u8; (width * height * 4) as usize];
             {
                 let mut canvas = Canvas::new(&mut bg, width, height);
                 canvas.fill_gradient4(corners);
                 self.grid = pixel_grid(stage_rect, ppp);
                 if let Some(grid) = &self.grid {
-                    painted_grid(&mut canvas, grid, ppp, look.palette.dark);
+                    if input.show_bg_spectrum {
+                        if input.braille_stream {
+                            painted_dot_grid(&mut canvas, grid, ppp);
+                        } else {
+                            painted_grid(&mut canvas, grid, ppp, !look.palette.dark);
+                        }
+                    }
                 }
             }
             self.bg = bg;
@@ -922,13 +946,12 @@ impl Stage {
         if buffer.width() as u32 != width || buffer.height() as u32 != height {
             buffer = slint::SharedPixelBuffer::new(width, height);
         }
-        let (info, disc_r) = {
+        let disc_r = {
             let mut canvas = Canvas::new(buffer.make_mut_bytes(), width, height);
             canvas.copy_from(&self.bg);
 
             let rect = stage_rect;
             let center = (rect.0 + rect.2 * 0.5, rect.1 + rect.3 * 0.5);
-            let mut info = None;
             if input.show_bg_spectrum {
                 if let Some(grid) = &self.grid {
                     if input.braille_stream {
@@ -936,7 +959,6 @@ impl Stage {
                     } else {
                         paint_led_cells(&mut canvas, grid, ppp, input.bars);
                     }
-                    info = Some(grid_info(grid));
                 }
             }
             if input.show_radial {
@@ -990,7 +1012,7 @@ impl Stage {
                     ppp,
                 );
             }
-            (info, base_disc_r)
+            base_disc_r
         };
         // The buffer shown last frame becomes the next scratch surface.
         if let Some(prev) = self.last_rendered.take() {
@@ -999,6 +1021,6 @@ impl Stage {
             }
         }
         self.last_rendered = Some(buffer.clone());
-        StageOutput { buffer, grid: info, disc_r }
+        StageOutput { buffer, disc_r }
     }
 }

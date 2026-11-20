@@ -1,0 +1,155 @@
+// Shared stylesheet for the Slint surface. All lengths are logical pixels.
+// Rust reads these exported tokens too; do not mirror geometry in Rust constants.
+export global Style {
+    // Typography: semantic roles can change independently of the size scale.
+    out property <string> family-ui: "Sarasa Mono SC";
+    out property <string> family-pixel: "Fusion Pixel 12px Mono latin";
+    out property <string> family-title: family-pixel;
+    out property <length> font-small: 12px;
+    out property <length> font-body: 14px;
+    out property <length> font-title: 16px;
+    out property <length> font-large: 24px;
+    // Fusion uses a native 12px grid. Only use integer multiples of this size.
+    out property <length> font-pixel-base: 12px;
+    out property <length> font-caption: font-small;
+    out property <length> font-button: font-small;
+    out property <length> font-library: font-body;
+    out property <length> font-track-title: font-pixel-base;
+    out property <length> font-app-title: font-title;
+    out property <length> font-core: font-title;
+    out property <length> font-heading: font-large;
+    out property <length> font-dock-title: font-pixel-base;
+    out property <length> font-dock-control: font-body;
+    out property <length> font-pixel-caption: font-pixel-base;
+    out property <length> font-lyric: font-pixel-base * 2;
+    out property <length> font-lyric-next: font-pixel-base;
+
+    // Spacing scale and reusable control metrics.
+    out property <length> stroke: 1px;
+    out property <length> space-xxs: 2px;
+    out property <length> space-xs: 4px;
+    out property <length> space-tight: 6px;
+    out property <length> space-sm: 8px;
+    out property <length> space-md: 12px;
+    out property <length> space-lg: 16px;
+    out property <length> space-xl: 20px;
+    out property <length> space-2xl: 24px;
+    out property <length> control-h: 22px;
+    out property <length> field-h: 20px;
+    out property <length> line-h: 18px;
+    out property <length> row-h: 26px;
+    out property <length> chip-h: 28px;
+    out property <length> close-w: 34px;
+    out property <length> close-h: 24px;
+
+    // Window chrome and stage text.
+    out property <length> window-w: 1180px;
+    out property <length> window-h: 760px;
+    out property <length> window-min-w: 920px;
+    out property <length> window-min-h: 600px;
+    out property <length> resize-border: space-tight;
+    out property <length> topbar-h: 44px;
+    out property <length> topbar-inset: 10px;
+    out property <length> topbar-toggle-w: 30px;
+    out property <length> topbar-mode-w: 58px;
+    out property <length> topbar-eq-w: 34px;
+    out property <length> topbar-system-w: 38px;
+    out property <length> topbar-window-button-w: 32px;
+    out property <length> topbar-actions-w: topbar-mode-w + topbar-eq-w
+        + topbar-system-w + topbar-window-button-w * 3 + space-tight * 5;
+    out property <length> sidebar-w: 360px;
+    out property <length> lyric-inset: 18px;
+    out property <length> lyric-current-y: 42px;
+    out property <length> lyric-next-y: lyric-current-y + font-lyric + space-xs;
+
+    // Library. List layout, scrolling and context-menu coordinates share these.
+    out property <length> library-inset: 14px;
+    out property <length> library-search-y: 34px;
+    out property <length> library-search-x: 62px;
+    out property <length> library-actions-y: library-search-y + field-h + space-sm;
+    out property <length> library-add-w: 74px;
+    out property <length> library-mode-w: 132px;
+    out property <length> library-download-w: 90px;
+    out property <length> library-separator-y: 95px;
+    out property <length> library-list-top: library-separator-y + space-sm;
+    out property <length> library-list-inset: space-sm;
+    out property <length> library-list-right: 22px;
+    out property <length> library-title-x: 58px;
+    out property <length> library-meta-reserve: 84px;
+    out property <length> library-meta-right: 80px;
+    out property <length> library-meta-w: 68px;
+    out property <length> scroll-cell-h: 13px;
+    out property <length> scroll-w: 14px;
+
+    // Dock: Fusion 12px song title / Sarasa 14px controls / 12px metadata.
+    // Sarasa Mono ASCII advance is half the font size; keep even sizes.
+    out property <length> dock-inset: space-lg;
+    out property <float> dock-content-fraction: 0.55;
+    out property <length> dock-content-min-w: 260px;
+    out property <length> dock-title-y: space-md;
+    // Keep the title row independent of the font's native size.
+    out property <length> dock-title-h: space-2xl;
+    out property <length> dock-meta-y: dock-title-y + dock-title-h + space-xxs;
+    out property <length> dock-seek-y: dock-meta-y + font-caption + space-xs;
+    out property <length> dock-seek-h: font-dock-control + space-tight;
+    out property <length> dock-controls-y: dock-seek-y + dock-seek-h + space-sm;
+    out property <length> dock-controls-h: font-dock-control + space-lg;
+    out property <length> dock-h: dock-controls-y + dock-controls-h + space-md;
+    out property <length> dock-cell-w: font-dock-control / 2;
+    out property <length> dock-time-gap: 10px;
+    out property <int> dock-seek-min-cells: 18;
+    out property <int> dock-seek-max-cells: 140;
+    out property <int> dock-volume-cells: 16;
+    out property <float> volume-max: 1.25;
+    out property <length> dock-button-w: 80px;
+    out property <length> dock-stop-w: 68px;
+    out property <length> dock-button-gap: space-md;
+    out property <length> dock-transport-w: dock-button-w * 3 + dock-stop-w + dock-button-gap * 3;
+
+    // Panels: common frame, header and body insets; content stays in main.slint.
+    out property <length> panel-inset: space-xl;
+    out property <length> panel-heading-y: 14px;
+    out property <length> panel-close-y: panel-heading-y - stroke;
+    out property <length> panel-body-y: 48px;
+    out property <length> panel-tab-w: 118px;
+    out property <length> settings-w: 470px;
+    out property <length> settings-h: 440px;
+    out property <length> eq-w: 700px;
+    out property <length> eq-h: 420px;
+    out property <length> eq-plot-y: 82px;
+    out property <length> eq-plot-h: 280px;
+    out property <length> eq-band-inset-top: control-h;
+    out property <length> eq-band-insets: eq-band-inset-top + space-2xl;
+    out property <length> download-w: 560px;
+    out property <length> download-h: 420px;
+    out property <length> dialog-w: 460px;
+    out property <length> dialog-h: 220px;
+    out property <length> toast-w: 480px;
+    out property <length> toast-h: 64px;
+
+    // Theme grid. Rust uses the same row stride and column count for its model.
+    out property <int> theme-columns: 4;
+    out property <length> theme-gap: space-sm;
+    out property <length> theme-auto-label-h: 14px;
+    out property <length> theme-group-label-h: control-h;
+    out property <length> theme-row-step: chip-h + space-tight;
+
+    // Context menu frame and row rhythm.
+    out property <length> menu-w: 232px;
+    out property <length> menu-item-h: 24px;
+    out property <length> menu-header-h: 28px;
+    out property <length> menu-body-y: menu-header-h + space-xs;
+    out property <length> menu-divider-gap: space-tight;
+}
+
+// Runtime color palette, supplied by Rust when the active theme changes.
+export global Theme {
+    in-out property <color> c-bg;
+    in-out property <color> c-bg-deep;
+    in-out property <color> c-surface;
+    in-out property <color> c-line;
+    in-out property <color> c-text-hi;
+    in-out property <color> c-text;
+    in-out property <color> c-text-dim;
+    in-out property <color> c-danger;
+}

@@ -14,7 +14,7 @@ Rust + egui（glow 后端）· Windows · 单文件 exe，字体内嵌，免安�
 
 ### 仿 TUI 界面
 
-- 无边框窗口、纯色背景、全局方角，布局统一使用 4 px 栅格的 design token（`src/design.rs`）
+- 无边框窗口、纯色背景、全局方角，字体、间距与公共布局尺寸集中在 `ui/style.slint`
 - 字符化控件：`[ add ]`、`[ download ]` 方括号按钮，行号选歌，字符进度条
 - 内嵌 Sarasa Mono SC 子集作为英文与界面主字体；中、日、韩文分别使用 Fusion Pixel 12px 点阵子集，并微调基线，中英混排高度不错位
 - 终端式打字机歌词：当前句带 `>` 前缀，宽 Insert 光标逐字打出，打完后停在句尾闪烁
@@ -253,10 +253,12 @@ decoder thread  ──SPSC ringbuf (2 s)──▶  cpal output callback  ──�
 | 文件 | 职责 |
 | --- | --- |
 | `src/main.rs` | 入口、窗口参数、崩溃日志 |
-| `src/app.rs` | 应用状态、UI 布局与交互 |
+| `src/ui.rs` | 应用状态、Slint 数据绑定与交互 |
+| `ui/main.slint` | 窗口、列表、底部控制区与面板布局 |
+| `ui/style.slint` / `ui/widgets.slint` | 共享样式 token 与公共控件；[字号和布局速查](ui/README.md) |
 | `src/audio.rs` | 输出流、解码线程、跳转与设备跟随 |
 | `src/spectrum.rs` | FFT 频谱、实时节拍、视觉特征 |
-| `src/viz.rs` | 圆环、LED 墙、点阵、钢琴卷帘的绘制 |
+| `src/stage.rs` / `src/raster.rs` | 圆环、LED 墙、点阵舞台与像素绘制 |
 | `src/pitch.rs` | 实时音高跟踪 |
 | `src/beat.rs` / `src/beat_config.rs` | 离线节拍分析与 `beat.json` |
 | `src/sound_profile.rs` | 节拍分析中顺带统计的整曲音频特征 |
@@ -268,7 +270,6 @@ decoder thread  ──SPSC ringbuf (2 s)──▶  cpal output callback  ──�
 | `src/lyrics.rs` | LRC 解析 |
 | `src/download.rs` | B 站音频下载与转码 |
 | `src/theme.rs` / `src/theme_library.rs` | 主题、配色推导、字体加载、`themes.json` |
-| `src/design.rs` | 间距、尺寸等设计 token |
 | `src/storage.rs` | 状态持久化 |
 
 ## 路线图
