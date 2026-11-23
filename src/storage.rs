@@ -79,6 +79,10 @@ pub struct PersistedState {
     pub lrc_map: HashMap<String, String>,
     #[serde(default = "default_peak_hold")]
     pub peak_hold: bool,
+    /// Peak hold for the pixel (dot matrix) style; separate so it can default
+    /// to off there while the smooth style keeps its markers.
+    #[serde(default)]
+    pub peak_hold_dots: bool,
     #[serde(default = "default_true")]
     pub show_lyrics: bool,
     #[serde(default)]
@@ -113,6 +117,7 @@ impl Default for PersistedState {
             eq_preset: default_eq_preset(),
             lrc_map: HashMap::new(),
             peak_hold: default_peak_hold(),
+            peak_hold_dots: false,
             show_lyrics: true,
             piano_mode: false,
             proxy: String::new(),

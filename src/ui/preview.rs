@@ -50,18 +50,17 @@ pub(super) fn render(dir: &Path) -> anyhow::Result<()> {
         .collect::<Vec<_>>(),
     )));
     ui.set_track_count(4);
+    ui.set_next_queue_count(3);
     ui.set_dock_title("中文歌曲 / サカナクション / 한국어 / Fusion 12".into());
     ui.set_dock_title_live(true);
+    // Freeze the shimmer band mid-title so screenshots show it.
+    ui.set_dock_shimmer(0.25);
+    ui.set_dock_next("下一首 / 次の曲 / 다음 곡 / Fusion 12".into());
     ui.set_lyric_current("中文歌词 / サカナクション / 한국어 / Pixel 24".into());
     ui.set_lyric_next("下一句歌词 / 次の歌詞 / 다음 가사 / Pixel 12".into());
     ui.set_lyric_active(true);
-    ui.set_time_text("0:41 / 5:00".into());
     ui.set_core_status("[PLAYING]".into());
     ui.set_play_label("PAUSE".into());
-    ui.set_seek_cells(60);
-    ui.set_seek_filled(8);
-    ui.set_seek_filled_str("#".repeat(8).into());
-    ui.set_seek_rest_str("-".repeat(52).into());
     let volume_cells = style.get_dock_volume_cells() as usize;
     let volume_filled = (volume_cells as f32 * 0.62).round() as usize;
     ui.set_vol_filled(volume_filled as i32);
@@ -169,6 +168,8 @@ pub(super) fn render(dir: &Path) -> anyhow::Result<()> {
         ("toast", normal_w, normal_h, true, true, true),
     ] {
         window.set_size(slint::PhysicalSize::new(width, height));
+        // Same path as the player: the seek meter follows the window width.
+        set_seek_meter(&ui, "0:41 / 5:00", 41.0 / 300.0);
         ui.set_window_maximized(name == "dots-maximized");
         ui.set_sidebar_open(sidebar);
         ui.set_visual_style(i32::from(dots));
@@ -192,8 +193,8 @@ pub(super) fn render(dir: &Path) -> anyhow::Result<()> {
         if name == "dock-hover" {
             window.dispatch_event(WindowEvent::PointerMoved {
                 position: slint::LogicalPosition::new(
-                    width as f32 / 2.0 - style.get_dock_transport_w() / 2.0
-                        + style.get_dock_button_w() * 1.5 + style.get_dock_button_gap(),
+                    ui.get_dock_transport_x() + style.get_dock_button_w() * 1.5
+                        + style.get_dock_button_gap(),
                     height as f32 - style.get_dock_h() + style.get_dock_controls_y()
                         + style.get_dock_controls_h() / 2.0,
                 ),
@@ -237,7 +238,8 @@ pub(super) fn render(dir: &Path) -> anyhow::Result<()> {
                 pulse_enabled: true,
                 show_bg_spectrum: show_bg,
                 show_radial: true,
-                peak_hold: true,
+                // Mirror the defaults: pixel mode ships with peak hold off.
+                peak_hold: !dots,
                 rotation: 0.17,
                 radial_scale: 1.0,
                 led_bars: dots,
@@ -275,7 +277,11 @@ pub(super) fn render(dir: &Path) -> anyhow::Result<()> {
     // component's hit-testing formula in a Rust assertion test.
     for (prefix, cells, y) in [
         (1.0, ui.get_seek_cells() as f32, style.get_dock_seek_y() + style.get_dock_seek_h() / 2.0),
-        (5.0, style.get_dock_volume_cells() as f32, style.get_dock_controls_y() + style.get_dock_controls_h() / 2.0),
+        (
+            style.get_dock_volume_prefix_cells() as f32,
+            style.get_dock_volume_cells() as f32,
+            style.get_dock_controls_y() + style.get_dock_controls_h() / 2.0,
+        ),
     ] {
         for fraction in [0.0, 0.5, 1.0] {
             let position = slint::LogicalPosition::new(
@@ -293,7 +299,7 @@ pub(super) fn render(dir: &Path) -> anyhow::Result<()> {
             });
         }
     }
-    let mut button_x = (normal_w as f32 - style.get_dock_transport_w()) / 2.0;
+    let mut button_x = ui.get_dock_transport_x();
     for width in [
         style.get_dock_button_w(), style.get_dock_button_w(),
         style.get_dock_stop_w(), style.get_dock_button_w(),

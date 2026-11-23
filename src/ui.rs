@@ -135,6 +135,12 @@ pub struct Player {
     search: String,
     sidebar_open: bool,
     next_queue: Vec<PathBuf>,
+    /// Shuffle's next pick, rolled ahead of time so the dock's NEXT preview and
+    /// the track that actually plays agree. Stored by path to survive list edits.
+    shuffle_next: Option<PathBuf>,
+    /// Seconds of playback since the current track started; drives the title
+    /// shimmer, so it freezes on pause and restarts from the left on a new track.
+    shimmer_clock: f32,
     scroll_y: f32,
     auto_scroll_target: Option<usize>,
     show_settings: bool,
@@ -221,6 +227,8 @@ impl Player {
             auto_scroll_target: None,
             sidebar_open: true,
             next_queue: Vec::new(),
+            shuffle_next: None,
+            shimmer_clock: 0.0,
             scroll_y: 0.0,
             show_settings: false,
             show_eq: false,
@@ -343,6 +351,8 @@ impl Player {
             return;
         }
         self.current = Some(index);
+        self.shuffle_next = None;
+        self.shimmer_clock = 0.0;
         self.state.current = Some(path.to_string_lossy().into_owned());
         self.refresh_lyrics();
         self.beat_age = 1.0;
@@ -589,23 +599,14 @@ impl Player {
         }
     }
 
-    fn pick_next(&self, forward: bool) -> Option<usize> {
+    fn pick_next(&mut self, forward: bool) -> Option<usize> {
         if self.playlist.is_empty() {
             return None;
         }
         match self.mode() {
             PlayMode::RepeatOne => self.current.or(Some(0)),
-            PlayMode::Shuffle => {
-                if self.playlist.len() == 1 {
-                    return Some(0);
-                }
-                let mut seed = SystemTimeSeed::new();
-                let mut index = (seed.next() as usize) % self.playlist.len();
-                if Some(index) == self.current {
-                    index = (index + 1) % self.playlist.len();
-                }
-                Some(index)
-            }
+            PlayMode::Shuffle if forward => self.shuffle_upcoming(),
+            PlayMode::Shuffle => Some(self.shuffle_roll()),
             PlayMode::Sequence => {
                 let current = self.current.unwrap_or(0);
                 let count = self.playlist.len();
@@ -616,6 +617,68 @@ impl Player {
                 };
                 Some(next)
             }
+        }
+    }
+
+    /// A random track other than the current one (any track when the list has one).
+    fn shuffle_roll(&self) -> usize {
+        let count = self.playlist.len();
+        if count <= 1 {
+            return 0;
+        }
+        let mut seed = SystemTimeSeed::new();
+        let mut index = (seed.next() as usize) % count;
+        if Some(index) == self.current {
+            index = (index + 1) % count;
+        }
+        index
+    }
+
+    /// Shuffle's pre-rolled next track; rolls (and remembers) one if the stored
+    /// pick is missing, was removed from the list, or became the current track.
+    fn shuffle_upcoming(&mut self) -> Option<usize> {
+        if self.playlist.is_empty() {
+            return None;
+        }
+        let stored = self.shuffle_next.as_ref().and_then(|path| {
+            self.playlist.iter().position(|track| &track.path == path)
+        });
+        if let Some(index) = stored {
+            if self.playlist.len() == 1 || Some(index) != self.current {
+                return Some(index);
+            }
+        }
+        let index = self.shuffle_roll();
+        self.shuffle_next = Some(self.playlist[index].path.clone());
+        Some(index)
+    }
+
+    /// Text for the dock's NEXT preview, following the same rules as `tick`'s
+    /// end-of-track handling and `advance(true)`. Empty when nothing is loaded.
+    fn upcoming_label(&mut self) -> String {
+        let Some(current) = self.current else {
+            return String::new();
+        };
+        if let Some(path) = self.next_queue.first() {
+            return self
+                .playlist
+                .iter()
+                .find(|track| &track.path == path)
+                .map(|track| track.title.clone())
+                .unwrap_or_else(|| track_title(path));
+        }
+        match self.mode() {
+            PlayMode::RepeatOne => "REPEAT ONE".to_owned(),
+            PlayMode::Sequence => self
+                .playlist
+                .get(current + 1)
+                .map(|track| track.title.clone())
+                .unwrap_or_else(|| "END OF LIST".to_owned()),
+            PlayMode::Shuffle => self
+                .shuffle_upcoming()
+                .and_then(|index| self.playlist.get(index))
+                .map(|track| track.title.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -671,7 +734,10 @@ impl Player {
 
     fn toggle_play(&mut self) {
         if self.engine.info().is_none() {
-            let index = self.current.or_else(|| self.pick_next(true));
+            let index = match self.current {
+                Some(index) => Some(index),
+                None => self.pick_next(true),
+            };
             if let Some(index) = index {
                 self.play_index(index);
             } else {
@@ -837,6 +903,23 @@ impl Player {
         self.engine.set_volume(volume);
         self.state.volume = volume;
         self.dirty = true;
+    }
+
+    fn dot_style(&self) -> bool {
+        self.state.led_bars && self.state.braille_stream
+    }
+
+    fn peak_hold_on(&self) -> bool {
+        if self.dot_style() { self.state.peak_hold_dots } else { self.state.peak_hold }
+    }
+
+    /// Peak hold for the active visual style (pixel mode has its own flag).
+    fn peak_hold_flag(&mut self) -> &mut bool {
+        if self.dot_style() {
+            &mut self.state.peak_hold_dots
+        } else {
+            &mut self.state.peak_hold
+        }
     }
 
     fn set_style(&mut self, style: u8) {
@@ -1061,6 +1144,18 @@ impl Player {
         let paused = self.engine.is_paused();
         let active = self.engine.info().is_some() && !paused;
 
+        // Title shimmer: advance while playing; once paused, let a band that is
+        // already crossing the title finish its sweep instead of vanishing.
+        let style = ui.global::<Style>();
+        let shimmer_period = style.get_dock_shimmer_period() as f32 / 1000.0;
+        if shimmer_period > 0.0 {
+            let phase = (self.shimmer_clock % shimmer_period) / shimmer_period;
+            let in_flight = phase > 0.0 && phase < style.get_dock_shimmer_sweep();
+            if active || (self.current.is_some() && in_flight) {
+                self.shimmer_clock += dt;
+            }
+        }
+
         if active {
             self.analyzer.push(&self.samples);
             let position = self.engine.position();
@@ -1110,7 +1205,7 @@ impl Player {
                 .current
                 .map_or(false, |index| index + 1 >= self.playlist.len());
             match self.mode() {
-                PlayMode::Sequence if at_end => {
+                PlayMode::Sequence if at_end && self.next_queue.is_empty() => {
                     // End of the queue: stop and stand by.
                     self.engine.stop();
                 }
@@ -1190,7 +1285,7 @@ impl Player {
                     pulse_enabled: self.state.show_core_pulse,
                     show_bg_spectrum: self.state.show_bg_spectrum,
                     show_radial: self.state.show_radial,
-                    peak_hold: self.state.peak_hold,
+                    peak_hold: self.peak_hold_on(),
                     rotation: self.ring_rotation,
                     radial_scale: self.state.radial_scale,
                     led_bars: self.state.led_bars,
@@ -1204,12 +1299,19 @@ impl Player {
             ui.set_disc_r(output.disc_r);
         }
 
-        // Dock: title, metadata, ASCII seek + volume, transport labels.
+        // Dock: title, ASCII seek + volume, transport labels.
+        // Before `info` borrows the engine: shuffle may roll and store its pick.
+        let next_text = self.upcoming_label();
+        ui.set_dock_next(next_text.into());
         let position = self.position();
         let duration = self.duration();
         let paused = self.engine.is_paused();
         let info = self.engine.info();
-        let time_text = format!("{} / {}", short_time(position), short_time(duration));
+        // Pad the position to the duration's width so the label, and the meter
+        // length derived from it, stay fixed for the whole track.
+        let (position_text, duration_text) = (short_time(position), short_time(duration));
+        let time_width = position_text.chars().count().max(duration_text.chars().count());
+        let time_text = format!("{position_text:>time_width$} / {duration_text}");
         let progress = if duration > 0.0 {
             (position / duration).clamp(0.0, 1.0) as f32
         } else {
@@ -1223,42 +1325,20 @@ impl Player {
             .unwrap_or_else(|| ("DROP AUDIO HERE / CTRL+O".to_owned(), false));
         ui.set_dock_title(title_text.into());
         ui.set_dock_title_live(title_live);
-
-        let format_label = info
-            .map(|info| extension_label(&info.path))
-            .unwrap_or_else(|| "---".to_owned());
-        let rate = info.map(|info| info.sample_rate as f32).unwrap_or(0.0);
-        let output = if info.is_some() {
-            elide_chars(&self.engine.output_label(), 46)
+        let shimmer_period = style.get_dock_shimmer_period() as f32 / 1000.0;
+        // Paused or resting phases put the band off the title, so it stays hidden.
+        ui.set_dock_shimmer(if title_live && shimmer_period > 0.0 {
+            (self.shimmer_clock % shimmer_period) / shimmer_period
         } else {
-            "NO OUTPUT".to_owned()
-        };
-        ui.set_meta_prefix(format!("{}   {:.1}K   ", format_label, rate / 1000.0).into());
-        ui.set_meta_output(output.into());
+            -1.0
+        });
 
         let mode = self.mode();
-        let mode_text = if self.next_queue.is_empty() {
-            format!("MODE: {}", mode.label())
-        } else {
-            format!("MODE: {}   NEXT {:02}", mode.label(), self.next_queue.len())
-        };
-        ui.set_mode_text(mode_text.clone().into());
+        ui.set_next_queue_count(self.next_queue.len() as i32);
         ui.set_mode_long(mode.label().to_owned().into());
         ui.set_mode_short(mode.short_label().to_owned().into());
 
-        // The meter and its Rust-generated strings share the style's advance.
-        let cell_w = style.get_dock_cell_w();
-        let time_w = time_text.chars().count() as f32 * cell_w;
-        let cells = (((ui.get_dock_content_w() - style.get_dock_time_gap() - time_w)
-            / cell_w).floor() as i32 - 2)
-            .clamp(style.get_dock_seek_min_cells(), style.get_dock_seek_max_cells()) as usize;
-        let shown = self.seek_preview.unwrap_or(progress);
-        let filled = ((shown * cells as f32).round() as usize).min(cells);
-        ui.set_seek_cells(cells as i32);
-        ui.set_seek_filled(filled as i32);
-        ui.set_seek_filled_str("#".repeat(filled).into());
-        ui.set_seek_rest_str("-".repeat(cells - filled).into());
-        ui.set_time_text(time_text.clone().into());
+        set_seek_meter(ui, &time_text, self.seek_preview.unwrap_or(progress));
         ui.set_progress(progress);
 
         let vol_norm = (self.engine.volume() / style.get_volume_max()).clamp(0.0, 1.0);
@@ -1283,7 +1363,7 @@ impl Player {
         ui.set_show_eq(self.show_eq);
         ui.set_show_download(self.show_download);
         ui.set_show_lyrics(self.state.show_lyrics);
-        ui.set_peak_hold(self.state.peak_hold);
+        ui.set_peak_hold(self.peak_hold_on());
         ui.set_show_bg_spectrum(self.state.show_bg_spectrum);
         ui.set_show_radial(self.state.show_radial);
         ui.set_show_core_pulse(self.state.show_core_pulse);
@@ -1359,21 +1439,22 @@ impl Player {
         // Sidebar UI: rebuild the track model on change; auto-scroll to the
         // track that just started playing.
         ui.set_track_count(self.playlist.len() as i32);
+        let filtered = self.filtered_indices();
         let list_h = ui.get_library_viewport_h();
         let row_h = style.get_row_h();
-        let content_h = self.playlist.len() as f32 * row_h;
+        let content_h = filtered.len() as f32 * row_h;
         let scroll_max = (content_h - list_h).max(0.0);
         ui.set_scroll_max(scroll_max);
         if let Some(index) = self.auto_scroll_target.take() {
-            let row = self.filtered_indices()
+            if let Some(row) = filtered
                 .iter()
                 .position(|&filtered| filtered == index)
-                .unwrap_or(index) as f32;
-            self.scroll_y = ((row * row_h - list_h * 0.5).clamp(0.0, scroll_max)) as f32;
+            {
+                self.scroll_y = ((row as f32 * row_h - list_h * 0.5).clamp(0.0, scroll_max)) as f32;
+            }
         }
         self.scroll_y = self.scroll_y.clamp(0.0, scroll_max);
         ui.set_scroll_y(self.scroll_y);
-        let filtered = self.filtered_indices();
         let current_cell = if filtered.is_empty() {
             -1
         } else {
@@ -1649,6 +1730,23 @@ fn auto_status(dark: Option<bool>, mood: Option<Mood>) -> String {
     }
 }
 
+/// Fill the dock's seek row: the meter takes whatever width the time label leaves
+/// in `dock-content-w`. Glyph strings and the cell count share the style's advance.
+fn set_seek_meter(ui: &Main, time_text: &str, shown: f32) {
+    let style = ui.global::<Style>();
+    let cell_w = style.get_dock_cell_w();
+    let time_w = time_text.chars().count() as f32 * cell_w;
+    let cells = (((ui.get_dock_content_w() - style.get_dock_time_gap() - time_w)
+        / cell_w).floor() as i32 - 2)
+        .clamp(style.get_dock_seek_min_cells(), style.get_dock_seek_max_cells()) as usize;
+    let filled = ((shown * cells as f32).round() as usize).min(cells);
+    ui.set_seek_cells(cells as i32);
+    ui.set_seek_filled(filled as i32);
+    ui.set_seek_filled_str("#".repeat(filled).into());
+    ui.set_seek_rest_str("-".repeat(cells - filled).into());
+    ui.set_time_text(time_text.into());
+}
+
 fn short_time(seconds: f64) -> String {
     let seconds = seconds.max(0.0).floor() as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)
@@ -1910,6 +2008,18 @@ pub fn run(initial: Option<PathBuf>) {
             player.search = text.to_string();
             player.track_ui_dirty = true;
             player.auto_scroll_target = None;
+            player.scroll_y = 0.0;
+        });
+    });
+    ui.on_reveal_current(|| {
+        with_player(|player| {
+            if let Some(index) = player.current {
+                if !player.sidebar_open {
+                    player.sidebar_open = true;
+                    player.stage_dirty = true;
+                }
+                player.auto_scroll_target = Some(index);
+            }
         });
     });
     ui.on_scroll_to(|offset| {
@@ -1945,7 +2055,8 @@ pub fn run(initial: Option<PathBuf>) {
     });
     ui.on_toggle_peak_hold(|| {
         with_player(|player| {
-            player.state.peak_hold = !player.state.peak_hold;
+            let flag = player.peak_hold_flag();
+            *flag = !*flag;
             player.stage_dirty = true;
             player.dirty = true;
         });

@@ -67,6 +67,8 @@ fn paint_spectrum(
     size_scale: f32,
     led_bars: bool,
     dot_bars: bool,
+    lattice: DotLattice,
+    kick: f32,
 ) {
     let (rx, ry, rw, rh) = rect;
     let usable = (rw.min(rh) * 0.5 - 8.0).max(1.0);
@@ -84,7 +86,9 @@ fn paint_spectrum(
     // Keep the continuous baseline and glow exclusive to the smooth mode.
     if led_bars {
         if dot_bars {
-            paint_radial_dots(canvas, rect, ppp, center, inner_r, max_amp, bars, peaks, show_peaks, rotation);
+            paint_radial_dots(
+                canvas, ppp, center, inner_r, max_amp, bars, peaks, show_peaks, rotation, lattice, kick,
+            );
         } else {
             paint_radial_led(canvas, center, ppp, inner_r, max_amp, bars, peaks, show_peaks, rotation, scale);
         }
@@ -488,11 +492,18 @@ fn paint_radial_led(
     }
 }
 
-/// DOT MATRIX radial spectrum: dot-pitch cells oriented along each spoke.
+/// DOT MATRIX radial spectrum as a filled wave on the background dot lattice.
+/// Every lattice dot inside the ring samples the spectrum at its own angle
+/// (smoothed, cosine-interpolated between bars) and lights up when it lies
+/// under the wave, so the ring has no gaps between spokes and its dots sit
+/// exactly on the same grid as the background stream and the core disc.
+/// Brightness follows each band's energy, both edges fade with sub-dot
+/// coverage, and the inner edge breathes on the kick. Peak-hold markers form
+/// a dotted contour above the wave (off by default in pixel mode; see
+/// `State::peak_hold_dots`).
 #[allow(clippy::too_many_arguments)]
 fn paint_radial_dots(
     canvas: &mut Canvas,
-    rect: (f32, f32, f32, f32),
     ppp: f32,
     center: (f32, f32),
     inner_r: f32,
@@ -501,44 +512,108 @@ fn paint_radial_dots(
     peaks: &[f32],
     show_peaks: bool,
     rotation: f32,
+    lattice: DotLattice,
+    kick: f32,
 ) {
-    let (step, dot) = dot_metrics_for_rect(rect, ppp);
-    let steps = ((max_amp / step).floor() as usize).max(1);
-    for i in 0..NUM_BARS {
-        let bar_value = bars.get(i).copied().unwrap_or(0.0);
-        let peak_value = peaks.get(i).copied().unwrap_or(0.0);
-        let norm = (bar_value / MAX_DB_VALUE).clamp(0.0, 1.0);
-        let peak_norm = (peak_value / MAX_DB_VALUE).clamp(0.0, 1.0);
-        if norm <= 0.01 && peak_norm <= 0.01 {
-            continue;
-        }
-        let angle =
-            std::f32::consts::FRAC_PI_2 + i as f32 / NUM_BARS as f32 * TAU + rotation;
-        let dir = (angle.cos(), angle.sin());
-        let radial = |r: f32| ((center.0 + dir.0 * r) * ppp, (center.1 + dir.1 * r) * ppp);
-        let lit = if norm <= 0.01 {
-            0
-        } else {
-            ((norm * steps as f32).ceil() as usize).clamp(1, steps)
-        };
-        for cell in 0..lit {
-            let r0 = inner_r + cell as f32 * step;
-            let r1 = (r0 + dot).min(inner_r + max_amp);
-            let t = ((cell + 1) as f32 / steps as f32).clamp(0.0, 1.0);
-            let level = (t * 3.0).round() / 3.0;
-            canvas.radial_cell(radial((r0 + r1) * 0.5), dir, (r1 - r0) * ppp, dot * ppp, spectrum_color(level));
-        }
-        if show_peaks && peak_value > bar_value + PEAK_MARKER_GAP_DB {
-            let half = dot * 0.5;
-            let outer = inner_r + max_amp;
-            let low = inner_r + half;
-            let high = (outer - half).max(low);
-            let peak_r = (inner_r + peak_norm * max_amp).clamp(low, high);
-            let r0 = peak_r - half;
-            let r1 = (peak_r + half).min(outer);
-            canvas.radial_cell(radial((r0 + r1) * 0.5), dir, (r1 - r0) * ppp, dot * ppp, spectrum_color(1.0));
+    // The inner edge breathes inward on each kick, in step with the core pulse.
+    const BREATH_DOTS: f32 = 3.0;
+    let DotLattice { step, dot, origin } = lattice;
+    let wave = smoothed_ring(bars);
+    let peak_wave = smoothed_ring(peaks);
+    let quiet = |ring: &[f32; NUM_BARS]| ring.iter().all(|value| *value <= 0.01);
+    if quiet(&wave) && !(show_peaks && !quiet(&peak_wave)) {
+        return;
+    }
+    let outer = inner_r + max_amp;
+    let base_r = inner_r - kick.clamp(0.0, 1.0) * BREATH_DOTS * step;
+    let low = (base_r - step).max(0.0);
+    let (inner2, outer2) = (low * low, (outer + step) * (outer + step));
+    let gap = PEAK_MARKER_GAP_DB / MAX_DB_VALUE;
+    let n = (outer / step).ceil() as i32 + 2;
+    let base_i = ((center.0 - origin.0) / step).floor() as i32;
+    let base_j = ((origin.1 - center.1) / step).floor() as i32;
+    // How much of a dot (one lattice step wide) lies inside an edge `gap` away:
+    // edges move with sub-dot precision by fading dots instead of popping them.
+    let coverage = |gap: f32| (gap / step + 0.5).clamp(0.0, 1.0);
+    for iy in -n..=n {
+        let y = origin.1 - (base_j + iy) as f32 * step;
+        let dy = y - center.1;
+        for ix in -n..=n {
+            let x = origin.0 + (base_i + ix) as f32 * step;
+            let dx = x - center.0;
+            let d2 = dx * dx + dy * dy;
+            if d2 < inner2 || d2 > outer2 {
+                continue;
+            }
+            let dist = d2.sqrt();
+            let index = ((dy.atan2(dx) - std::f32::consts::FRAC_PI_2 - rotation) / TAU
+                * NUM_BARS as f32)
+                .rem_euclid(NUM_BARS as f32);
+            let level = sample_ring(&wave, index);
+            // Any audible band keeps at least one dot so the base ring stays closed.
+            let reach = (inner_r + (level * max_amp).max(step)).min(outer);
+            let cover = if level > 0.01 {
+                coverage(reach - dist).min(coverage(dist - base_r))
+            } else {
+                0.0
+            };
+            if cover > 0.02 {
+                // Brightness follows this band's energy as well as the radius, so
+                // the inner dots rise and fall with the music instead of sitting
+                // at a fixed dim shade.
+                let t = ((dist - inner_r) / max_amp).clamp(0.0, 1.0);
+                let shade = level.powf(0.7) * (0.45 + 0.55 * t);
+                let alpha_v = (cover * 255.0).round() as u8;
+                canvas.pixel_square(
+                    x * ppp,
+                    y * ppp,
+                    dot * ppp,
+                    with_alpha(spectrum_color(shade), alpha_v),
+                );
+                if cover >= 0.98 {
+                    continue;
+                }
+            }
+            if show_peaks {
+                let peak = sample_ring(&peak_wave, index);
+                let peak_r = (inner_r + peak * max_amp).min(outer);
+                if peak > level + gap && (dist - peak_r).abs() <= step * 0.5 {
+                    canvas.pixel_square(x * ppp, y * ppp, dot * ppp, spectrum_color(1.0));
+                }
+            }
         }
     }
+}
+
+/// Dot pitch, dot size and one lattice dot centre, shared by every painter
+/// that must land on the background dot grid.
+#[derive(Clone, Copy)]
+struct DotLattice {
+    step: f32,
+    dot: f32,
+    origin: (f32, f32),
+}
+
+/// Normalised bar heights around the ring with a circular [1, 2, 1] / 4 blur,
+/// so the interpolated wave has no single-bar spikes.
+fn smoothed_ring(values: &[f32]) -> [f32; NUM_BARS] {
+    let norm = |i: usize| (values.get(i).copied().unwrap_or(0.0) / MAX_DB_VALUE).clamp(0.0, 1.0);
+    let mut out = [0.0; NUM_BARS];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let prev = norm((i + NUM_BARS - 1) % NUM_BARS);
+        let next = norm((i + 1) % NUM_BARS);
+        *slot = (prev + 2.0 * norm(i) + next) * 0.25;
+    }
+    out
+}
+
+/// Cosine interpolation between neighbouring bars, wrapping at the seam.
+fn sample_ring(ring: &[f32; NUM_BARS], index: f32) -> f32 {
+    let floor = index.floor();
+    let i0 = (floor as usize) % NUM_BARS;
+    let i1 = (i0 + 1) % NUM_BARS;
+    let w = (1.0 - ((index - floor) * std::f32::consts::PI).cos()) * 0.5;
+    ring[i0] * (1.0 - w) + ring[i1] * w
 }
 
 /// Dot-matrix background stream (the braille variant, drawn as real dots so
@@ -952,6 +1027,14 @@ impl Stage {
 
             let rect = stage_rect;
             let center = (rect.0 + rect.2 * 0.5, rect.1 + rect.3 * 0.5);
+            // One dot lattice for the background stream, radial wave and core.
+            let lattice = if let Some(grid) = &self.grid {
+                let (step, dot) = dot_metrics_from_grid(grid, ppp);
+                DotLattice { step, dot, origin: (grid.left + step * 0.5, grid.bottom - step * 0.5) }
+            } else {
+                let (step, dot) = dot_metrics_for_rect(rect, ppp);
+                DotLattice { step, dot, origin: center }
+            };
             if input.show_bg_spectrum {
                 if let Some(grid) = &self.grid {
                     if input.braille_stream {
@@ -973,19 +1056,15 @@ impl Stage {
                     input.radial_scale,
                     input.led_bars,
                     input.dot_style,
+                    lattice,
+                    if input.pulse_enabled { input.visual.kick } else { 0.0 },
                 );
             }
             let usable = (rect.2.min(rect.3) * 0.5 - 8.0).max(1.0);
             let base_disc_r = core_radius(usable);
             if input.dot_style {
                 let kick = if input.pulse_enabled { input.visual.kick } else { 0.0 };
-                let (step, dot, origin) = if let Some(grid) = &self.grid {
-                    let (step, dot) = dot_metrics_from_grid(grid, ppp);
-                    (step, dot, (grid.left + step * 0.5, grid.bottom - step * 0.5))
-                } else {
-                    let (step, dot) = dot_metrics_for_rect(rect, ppp);
-                    (step, dot, center)
-                };
+                let DotLattice { step, dot, origin } = lattice;
                 let age = if input.pulse_enabled { input.beat_age } else { 1.0 };
                 let strength = if input.pulse_enabled { input.ring_strength } else { 0.0 };
                 paint_core_dots(

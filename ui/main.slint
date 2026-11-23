@@ -75,8 +75,12 @@ export component Main inherits Window {
 
     out property <length> library-viewport-h: Math.max(1px,
         root.stage-h - Style.library-list-top - Style.space-sm);
+    // Seek meter + time label width; Rust derives the meter's cell count from it.
     out property <length> dock-content-w: Math.max(Style.dock-content-min-w,
         root.width * Style.dock-content-fraction);
+    // Transport group is centered under the seek row; preview reads this too.
+    out property <length> dock-transport-x:
+        Math.round((root.width - Style.dock-transport-w) / 2 / 1px) * 1px;
 
     // ---------- stage ----------
     in-out property <image> stage;
@@ -91,6 +95,8 @@ export component Main inherits Window {
     in-out property <string> search-text;
     in-out property <int> track-count: 0;
     in-out property <string> mode-short: "SQ";
+    // Queued "play next" count, shown on the mode button; 0 hides it.
+    in-out property <int> next-queue-count: 0;
     in-out property <float> scroll-y: 0;
     in-out property <float> scroll-max: 0;
     in-out property <int> current-cell: -1;
@@ -105,9 +111,10 @@ export component Main inherits Window {
     // ---------- dock ----------
     in-out property <string> dock-title: "DROP AUDIO HERE / CTRL+O";
     in-out property <bool> dock-title-live: false;
-    in-out property <string> meta-prefix: "---   0.0K   ";
-    in-out property <string> meta-output: "NO OUTPUT";
-    in-out property <string> mode-text: "MODE: SEQUENCE";
+    // Upcoming track title (queue head, pre-rolled shuffle pick, ...); empty hides it.
+    in-out property <string> dock-next: "";
+    // Title shimmer phase in [0, 1) while playing; -1 hides the band.
+    in-out property <float> dock-shimmer: -1;
     in-out property <float> progress: 0;
     in-out property <int> seek-cells: 36;
     in-out property <int> seek-filled: 0;
@@ -193,6 +200,7 @@ export component Main inherits Window {
     callback toggle-play();
     callback next-track();
     callback prev-track();
+    callback reveal-current();
     callback stop();
     callback seek(float);
     callback seek-preview(float);
@@ -435,7 +443,7 @@ export component Main inherits Window {
         }
         Text {
             x: Style.library-inset;
-            y: Style.space-tight;
+            y: Style.space-sm;
             text: "LIBRARY";
             font-size: Style.font-library;
             color: Theme.c-text-hi;
@@ -498,7 +506,8 @@ export component Main inherits Window {
             height: Style.control-h;
             TuiBtn {
                 width: parent.width;
-                label: "[ mode: " + root.mode-short + " ]";
+                label: "[ mode: " + root.mode-short
+                    + (root.next-queue-count > 0 ? " +" + root.next-queue-count : "") + " ]";
                 clicked => root.cycle-mode();
             }
         }
@@ -686,31 +695,113 @@ export component Main inherits Window {
             height: Style.stroke;
             background: Theme.c-line;
         }
+        // Row 1: current title (Fusion, left) and the upcoming track
+        // (dim, right-aligned). Clicking the title reveals it.
+        // Pixel bold: a bitmap terminal's double strike, one pixel to the right.
         Text {
+            visible: root.dock-title-live;
+            x: dock-title-text.x + Style.dock-title-bold;
+            y: dock-title-text.y;
+            width: dock-title-text.width;
+            height: dock-title-text.height;
+            vertical-alignment: center;
+            text: root.dock-title;
+            font-family: Style.family-title;
+            font-size: Style.font-dock-title;
+            color: dock-title-text.color;
+            overflow: elide;
+        }
+        dock-title-text := Text {
             x: Style.dock-inset;
             y: Style.dock-title-y;
-            width: root.dock-content-w;
+            width: Math.min(self.preferred-width, root.dock-content-w);
             height: Style.dock-title-h;
             vertical-alignment: center;
             text: root.dock-title;
             font-family: Style.family-title;
             font-size: Style.font-dock-title;
-            color: root.dock-title-live ? Theme.c-text-hi : Theme.c-text-dim;
+            // While a track is loaded the base sits one step below text-hi so the
+            // shimmer band has room to brighten; idle stays dim.
+            color: root.dock-title-live ? Theme.c-text : Theme.c-text-dim;
+            overflow: elide;
+            TouchArea {
+                enabled: root.dock-title-live;
+                mouse-cursor: root.dock-title-live ? pointer : default;
+                clicked => root.reveal-current();
+            }
+        }
+        // Shimmer: nested clip windows over copies of the bold title, widest and
+        // dimmest first, so the band steps up to text-hi at its centre (pixel
+        // gradient). Rust drives `dock-shimmer` in [0, 1) while playing, -1 otherwise;
+        // the band crosses during the first `dock-shimmer-sweep` of each period.
+        if root.dock-title-live && root.dock-shimmer >= 0: Rectangle {
+            property <length> span: dock-title-text.width + Style.dock-title-bold;
+            property <length> centre: -Style.dock-shimmer-half
+                + root.dock-shimmer / Style.dock-shimmer-sweep
+                    * (self.span + Style.dock-shimmer-half * 2);
+            x: dock-title-text.x;
+            y: dock-title-text.y;
+            width: self.span;
+            height: dock-title-text.height;
+            clip: true;
+            for step in Style.dock-shimmer-steps: Rectangle {
+                property <float> level: (step + 1) / Style.dock-shimmer-steps;
+                property <length> half: Style.dock-shimmer-half
+                    * (Style.dock-shimmer-steps - step) / Style.dock-shimmer-steps;
+                x: parent.centre - self.half;
+                width: self.half * 2;
+                height: parent.height;
+                clip: true;
+                Text {
+                    x: -parent.x;
+                    width: dock-title-text.width;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: root.dock-title;
+                    font-family: Style.family-title;
+                    font-size: Style.font-dock-title;
+                    color: Theme.c-text-hi.mix(Theme.c-text, parent.level);
+                    overflow: elide;
+                }
+                Text {
+                    x: -parent.x + Style.dock-title-bold;
+                    width: dock-title-text.width;
+                    height: parent.height;
+                    vertical-alignment: center;
+                    text: root.dock-title;
+                    font-family: Style.family-title;
+                    font-size: Style.font-dock-title;
+                    color: Theme.c-text-hi.mix(Theme.c-text, parent.level);
+                    overflow: elide;
+                }
+            }
+        }
+        dock-next-text := Text {
+            visible: root.dock-next != "";
+            width: Math.max(0px, Math.min(self.preferred-width, parent.width - Style.dock-inset
+                - (dock-title-text.x + dock-title-text.width + Style.dock-title-bold
+                    + Style.dock-cluster-gap)
+                - dock-next-label.preferred-width - Style.dock-next-label-gap));
+            x: parent.width - Style.dock-inset - self.width;
+            y: Style.dock-title-y;
+            height: Style.dock-title-h;
+            vertical-alignment: center;
+            horizontal-alignment: right;
+            text: root.dock-next;
+            font-family: Style.family-title;
+            font-size: Style.font-dock-title;
+            color: Theme.c-text-dim;
             overflow: elide;
         }
-        Text {
-            x: Style.dock-inset;
-            y: Style.dock-meta-y;
-            text: root.meta-prefix + root.meta-output;
+        dock-next-label := Text {
+            visible: root.dock-next != "";
+            x: dock-next-text.x - Style.dock-next-label-gap - self.preferred-width;
+            y: Style.dock-title-y;
+            height: Style.dock-title-h;
+            vertical-alignment: center;
+            text: "NEXT";
             font-size: Style.font-caption;
-            color: Theme.c-text-dim;
-        }
-        Text {
-            x: parent.width - self.width - Style.dock-inset;
-            y: Style.dock-meta-y;
-            text: root.mode-text;
-            font-size: Style.font-caption;
-            color: Theme.c-text-dim;
+            color: Theme.c-text-dim.with-alpha(0.6);
         }
         AsciiMeter {
             x: Style.dock-inset;
@@ -729,7 +820,7 @@ export component Main inherits Window {
             y: Style.dock-controls-y;
             height: Style.dock-controls-h;
             prefix: "VOL [";
-            prefix-cells: 5;
+            prefix-cells: Style.dock-volume-prefix-cells;
             cells: Style.dock-volume-cells;
             filled: root.vol-filled;
             fill-text: root.vol-fill-str;
@@ -742,7 +833,7 @@ export component Main inherits Window {
             changed(position) => root.set-volume(position * Style.volume-max);
         }
         HorizontalLayout {
-            x: Math.round((parent.width - Style.dock-transport-w) / 2 / 1px) * 1px;
+            x: root.dock-transport-x;
             y: Style.dock-controls-y;
             width: Style.dock-transport-w;
             height: Style.dock-controls-h;
@@ -805,7 +896,8 @@ export component Main inherits Window {
                 height: parent.height;
                 vertical-alignment: center;
                 text: "  " + root.context-title;
-                font-size: Style.font-caption;
+                font-family: Style.family-title;
+                font-size: Style.font-track-title;
                 color: Theme.c-text-hi;
                 overflow: elide;
             }

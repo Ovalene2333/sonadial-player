@@ -1,25 +1,24 @@
 // Shared stylesheet for the Slint surface. All lengths are logical pixels.
 // Rust reads these exported tokens too; do not mirror geometry in Rust constants.
 export global Style {
-    // Typography: semantic roles can change independently of the size scale.
+    // Typography: 3-tier scale (12 / 16 / 24 px); semantic roles can override independently.
     out property <string> family-ui: "Sarasa Mono SC";
     out property <string> family-pixel: "Fusion Pixel 12px Mono latin";
     out property <string> family-title: family-pixel;
     out property <length> font-small: 12px;
-    out property <length> font-body: 14px;
     out property <length> font-title: 16px;
     out property <length> font-large: 24px;
     // Fusion uses a native 12px grid. Only use integer multiples of this size.
     out property <length> font-pixel-base: 12px;
     out property <length> font-caption: font-small;
     out property <length> font-button: font-small;
-    out property <length> font-library: font-body;
+    out property <length> font-library: font-small;
     out property <length> font-track-title: font-pixel-base;
     out property <length> font-app-title: font-title;
     out property <length> font-core: font-title;
     out property <length> font-heading: font-large;
     out property <length> font-dock-title: font-pixel-base;
-    out property <length> font-dock-control: font-body;
+    out property <length> font-dock-control: font-small;
     out property <length> font-pixel-caption: font-pixel-base;
     out property <length> font-lyric: font-pixel-base * 2;
     out property <length> font-lyric-next: font-pixel-base;
@@ -81,24 +80,43 @@ export global Style {
     out property <length> scroll-cell-h: 13px;
     out property <length> scroll-w: 14px;
 
-    // Dock: Fusion 12px song title / Sarasa 14px controls / 12px metadata.
+    // Dock: Fusion 12px song title / Sarasa 12px controls.
     // Sarasa Mono ASCII advance is half the font size; keep even sizes.
     out property <length> dock-inset: space-lg;
     out property <float> dock-content-fraction: 0.55;
     out property <length> dock-content-min-w: 260px;
-    out property <length> dock-title-y: space-md;
-    // Keep the title row independent of the font's native size.
-    out property <length> dock-title-h: space-2xl;
-    out property <length> dock-meta-y: dock-title-y + dock-title-h + space-xxs;
-    out property <length> dock-seek-y: dock-meta-y + font-caption + space-xs;
+    // Vertical rhythm is set by the visual gaps between glyphs, not row boxes:
+    // equal top/bottom margins and one equal gap between all three rows.
+    // Each row's inner pad is (h - font) / 2.
+    out property <length> dock-margin: 14px;
+    out property <length> dock-row-gap: space-md;
+    out property <length> dock-title-h: font-dock-title + space-sm;
     out property <length> dock-seek-h: font-dock-control + space-tight;
-    out property <length> dock-controls-y: dock-seek-y + dock-seek-h + space-sm;
     out property <length> dock-controls-h: font-dock-control + space-lg;
-    out property <length> dock-h: dock-controls-y + dock-controls-h + space-md;
+    out property <length> dock-title-y: dock-margin - (dock-title-h - font-dock-title) / 2;
+    out property <length> dock-seek-y: dock-title-y + (dock-title-h + font-dock-title) / 2
+        + dock-row-gap - (dock-seek-h - font-dock-control) / 2;
+    out property <length> dock-controls-y: dock-seek-y + (dock-seek-h + font-dock-control) / 2
+        + dock-row-gap - (dock-controls-h - font-dock-control) / 2;
+    out property <length> dock-h: dock-controls-y + (dock-controls-h + font-dock-control) / 2
+        + dock-margin;
+    // Row 1 right side: "NEXT" label + upcoming title, kept clear of the current title.
+    out property <length> dock-cluster-gap: space-2xl;
+    out property <length> dock-next-label-gap: space-sm;
+    // Title emphasis: pixel bold offset (a bitmap terminal's double strike).
+    out property <length> dock-title-bold: stroke;
+    // Title shimmer while playing: one band per period, crossing during the first
+    // `sweep` fraction and resting for the rest; `steps` nested bands form the
+    // pixel gradient out to `half` on each side of the band centre.
+    out property <duration> dock-shimmer-period: 2800ms;
+    out property <float> dock-shimmer-sweep: 0.6;
+    out property <length> dock-shimmer-half: 36px;
+    out property <int> dock-shimmer-steps: 3;
     out property <length> dock-cell-w: font-dock-control / 2;
     out property <length> dock-time-gap: 10px;
     out property <int> dock-seek-min-cells: 18;
-    out property <int> dock-seek-max-cells: 140;
+    out property <int> dock-seek-max-cells: 180;
+    out property <int> dock-volume-prefix-cells: 5;
     out property <int> dock-volume-cells: 16;
     out property <float> volume-max: 1.25;
     out property <length> dock-button-w: 80px;
